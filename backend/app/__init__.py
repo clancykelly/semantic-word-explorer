@@ -1,0 +1,1 @@
+# Semantic Word Explorer API

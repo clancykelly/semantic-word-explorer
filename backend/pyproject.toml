@@ -1,0 +1,38 @@
+[project]
+name = "semantic-word-explorer-api"
+version = "0.1.0"
+description = "FastAPI backend for Semantic Word Explorer with FAISS embeddings"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic>=2.5.0",
+    "numpy>=1.26.0",
+    "python-Levenshtein>=0.23.0",
+]
+
+[project.optional-dependencies]
+ml = [
+    "faiss-cpu>=1.7.4",
+    "umap-learn>=0.5.5",
+    "scikit-learn>=1.4.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "httpx>=0.26.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
