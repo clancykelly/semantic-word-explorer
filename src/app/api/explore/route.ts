@@ -50,7 +50,10 @@ function transformResponse(python: PythonExploreResponse): ExploreResponse {
       sense: python.query.sense,
       availableSenses: python.query.available_senses,
     },
-    neighbors: python.neighbors,
+    neighbors: python.neighbors.map((n) => ({
+      ...n,
+      frequency: n.frequency as "common" | "uncommon" | "rare",
+    })),
     clusters: python.clusters,
     meta: {
       totalResults: python.meta.total_results,
@@ -72,11 +75,17 @@ export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
   const word = searchParams.get("word");
   const sense = searchParams.get("sense");
+  const mode = searchParams.get("mode") || "semantic";
+  const layout = searchParams.get("layout") || "sectors";
+  const includeRare = searchParams.get("includeRare") === "true";
 
   // Build URL for Python backend
   const backendParams = new URLSearchParams();
   if (word) backendParams.set("word", word);
   if (sense) backendParams.set("sense", sense);
+  backendParams.set("mode", mode);
+  backendParams.set("layout", layout);
+  backendParams.set("include_rare", includeRare ? "true" : "false");
 
   try {
     const response = await fetch(

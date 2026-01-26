@@ -1,4 +1,4 @@
-import type { ExploreResponse, ErrorResponse } from "./types";
+import type { ExploreResponse, ErrorResponse, SearchMode, LayoutType } from "./types";
 
 export type ApiResult =
   | { success: true; data: ExploreResponse }
@@ -6,12 +6,18 @@ export type ApiResult =
 
 export async function exploreWord(
   word: string,
-  sense?: string
+  sense?: string,
+  mode: SearchMode = "semantic",
+  layout: LayoutType = "sectors",
+  includeRare: boolean = false
 ): Promise<ApiResult> {
   try {
-    const params = new URLSearchParams({ word });
+    const params = new URLSearchParams({ word, mode, layout });
     if (sense) {
       params.set("sense", sense);
+    }
+    if (includeRare) {
+      params.set("includeRare", "true");
     }
 
     const response = await fetch(`/api/explore?${params.toString()}`);

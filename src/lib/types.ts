@@ -2,6 +2,10 @@
 
 export type FrequencyTier = "common" | "uncommon" | "rare";
 
+export type SearchMode = "semantic" | "contextual";
+
+export type LayoutType = "sectors" | "rings" | "force" | "grid";
+
 export interface Coordinates {
   x: number;
   y: number;

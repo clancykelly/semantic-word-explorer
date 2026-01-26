@@ -7,7 +7,7 @@ import { SearchInput } from "@/components/SearchInput";
 import { SensePicker } from "@/components/SensePicker";
 import { WordScatterPlot } from "@/components/WordScatterPlot";
 import { exploreWord } from "@/lib/api";
-import type { SearchState } from "@/lib/types";
+import type { SearchState, SearchMode, LayoutType } from "@/lib/types";
 
 interface ExplorePageProps {
   params: Promise<{ word: string }>;
@@ -24,13 +24,16 @@ export default function ExplorePage({ params }: ExplorePageProps) {
     error: null,
   });
   const [selectedSense, setSelectedSense] = useState<string | null>(null);
+  const [mode, setMode] = useState<SearchMode>("semantic");
+  const [layout, setLayout] = useState<LayoutType>("sectors");
+  const [includeRare, setIncludeRare] = useState<boolean>(false);
 
   // Fetch word data
   const fetchWord = useCallback(
-    async (searchWord: string, sense?: string) => {
+    async (searchWord: string, sense: string | undefined, searchMode: SearchMode, searchLayout: LayoutType, searchIncludeRare: boolean) => {
       setState((prev) => ({ ...prev, status: "loading", error: null }));
 
-      const result = await exploreWord(searchWord, sense);
+      const result = await exploreWord(searchWord, sense, searchMode, searchLayout, searchIncludeRare);
 
       if (result.success) {
         setState({
@@ -53,18 +56,34 @@ export default function ExplorePage({ params }: ExplorePageProps) {
     []
   );
 
-  // Initial load
+  // Initial load and mode/layout/includeRare change
   useEffect(() => {
-    void fetchWord(decodedWord);
-  }, [decodedWord, fetchWord]);
+    void fetchWord(decodedWord, selectedSense || undefined, mode, layout, includeRare);
+  }, [decodedWord, mode, layout, includeRare, fetchWord, selectedSense]);
 
   // Handle sense change
   const handleSenseChange = useCallback(
     (sense: string) => {
       setSelectedSense(sense);
-      fetchWord(decodedWord, sense);
+      fetchWord(decodedWord, sense, mode, layout, includeRare);
     },
-    [decodedWord, fetchWord]
+    [decodedWord, fetchWord, mode, layout, includeRare]
+  );
+
+  // Handle mode change
+  const handleModeChange = useCallback(
+    (newMode: SearchMode) => {
+      setMode(newMode);
+    },
+    []
+  );
+
+  // Handle layout change
+  const handleLayoutChange = useCallback(
+    (newLayout: LayoutType) => {
+      setLayout(newLayout);
+    },
+    []
   );
 
   // Handle new search
@@ -87,8 +106,16 @@ export default function ExplorePage({ params }: ExplorePageProps) {
 
   // Handle retry
   const handleRetry = useCallback(() => {
-    fetchWord(decodedWord, selectedSense || undefined);
-  }, [decodedWord, selectedSense, fetchWord]);
+    fetchWord(decodedWord, selectedSense || undefined, mode, layout, includeRare);
+  }, [decodedWord, selectedSense, fetchWord, mode, layout, includeRare]);
+
+  // Handle include rare toggle
+  const handleIncludeRareChange = useCallback(
+    (newIncludeRare: boolean) => {
+      setIncludeRare(newIncludeRare);
+    },
+    []
+  );
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-zinc-50 to-white dark:from-zinc-950 dark:to-zinc-900">
@@ -110,6 +137,67 @@ export default function ExplorePage({ params }: ExplorePageProps) {
               onDidYouMeanClick={handleSearch}
             />
           </div>
+          {/* Mode Toggle */}
+          <div className="flex items-center gap-1 p-1 bg-zinc-100 dark:bg-zinc-800 rounded-full">
+            <button
+              onClick={() => handleModeChange("semantic")}
+              className={`px-4 py-1.5 rounded-full text-sm font-medium transition-all ${
+                mode === "semantic"
+                  ? "bg-white dark:bg-zinc-700 text-indigo-600 dark:text-indigo-400 shadow-sm"
+                  : "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200"
+              }`}
+              title="Find true synonyms and words with similar meanings"
+            >
+              Semantic
+            </button>
+            <button
+              onClick={() => handleModeChange("contextual")}
+              className={`px-4 py-1.5 rounded-full text-sm font-medium transition-all ${
+                mode === "contextual"
+                  ? "bg-white dark:bg-zinc-700 text-indigo-600 dark:text-indigo-400 shadow-sm"
+                  : "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200"
+              }`}
+              title="Find words that appear in similar contexts"
+            >
+              Contextual
+            </button>
+          </div>
+
+          {/* Layout Selector (semantic mode only) */}
+          {mode === "semantic" && (
+            <select
+              value={layout}
+              onChange={(e) => handleLayoutChange(e.target.value as LayoutType)}
+              className="px-3 py-1.5 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700
+                bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300
+                focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              title="Choose visualization layout"
+            >
+              <option value="sectors">Sectors</option>
+              <option value="rings">Rings</option>
+              <option value="force">Force</option>
+              <option value="grid">Grid</option>
+            </select>
+          )}
+
+          {/* Include Rare Words Toggle (semantic mode only) */}
+          {mode === "semantic" && (
+            <label
+              className="flex items-center gap-2 cursor-pointer"
+              title="Include rare and uncommon words in results"
+            >
+              <input
+                type="checkbox"
+                checked={includeRare}
+                onChange={(e) => handleIncludeRareChange(e.target.checked)}
+                className="w-4 h-4 rounded border-zinc-300 dark:border-zinc-600
+                  text-indigo-600 focus:ring-indigo-500 focus:ring-offset-0"
+              />
+              <span className="text-sm text-zinc-600 dark:text-zinc-400">
+                Rare words
+              </span>
+            </label>
+          )}
         </div>
       </header>
 
@@ -219,6 +307,21 @@ export default function ExplorePage({ params }: ExplorePageProps) {
               <p className="text-sm text-zinc-500 dark:text-zinc-400">
                 Found {state.data.meta.totalResults} related words in{" "}
                 {state.data.meta.queryTimeMs}ms
+              </p>
+
+              {/* Mode description */}
+              <p className="text-xs text-zinc-400 dark:text-zinc-500 max-w-md mx-auto">
+                {mode === "semantic" ? (
+                  <>
+                    <span className="font-medium text-indigo-600 dark:text-indigo-400">Semantic mode:</span>{" "}
+                    True synonyms and words with similar meanings
+                  </>
+                ) : (
+                  <>
+                    <span className="font-medium text-indigo-600 dark:text-indigo-400">Contextual mode:</span>{" "}
+                    Words that appear in similar contexts (co-occurrence)
+                  </>
+                )}
               </p>
             </div>
 

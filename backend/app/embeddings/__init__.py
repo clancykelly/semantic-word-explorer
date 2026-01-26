@@ -2,12 +2,19 @@
 
 from .base import EmbeddingProvider
 from .mock import MockEmbeddingProvider
+from .datamuse_provider import DatamuseProvider
 
-__all__ = ["EmbeddingProvider", "MockEmbeddingProvider", "get_embedding_provider"]
+__all__ = [
+    "EmbeddingProvider",
+    "MockEmbeddingProvider",
+    "DatamuseProvider",
+    "get_embedding_provider",
+    "get_datamuse_provider",
+]
 
 
 def get_embedding_provider() -> EmbeddingProvider:
-    """Get the configured embedding provider.
+    """Get the configured embedding provider for contextual similarity.
 
     Environment variables:
         EMBEDDING_PROVIDER: "mock" (default) or "faiss"
@@ -32,3 +39,8 @@ def get_embedding_provider() -> EmbeddingProvider:
 
     else:
         raise ValueError(f"Unknown embedding provider: {provider_type}")
+
+
+def get_datamuse_provider() -> DatamuseProvider:
+    """Get the Datamuse provider for semantic similarity."""
+    return DatamuseProvider()

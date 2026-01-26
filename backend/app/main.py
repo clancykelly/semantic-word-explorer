@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .embeddings import EmbeddingProvider, get_embedding_provider
+from .embeddings import EmbeddingProvider, get_embedding_provider, get_datamuse_provider
 from .models import (
     Cluster,
     Coordinates,
@@ -23,24 +23,36 @@ from .models import (
     WordSense,
 )
 
-# Global embedding provider instance
-embedding_provider: EmbeddingProvider | None = None
+# Global embedding provider instances
+contextual_provider: EmbeddingProvider | None = None  # FAISS/GloVe for contextual similarity
+semantic_provider: EmbeddingProvider | None = None    # Datamuse for semantic similarity
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup resources."""
-    global embedding_provider
+    global contextual_provider, semantic_provider
 
-    # Initialize embedding provider based on configuration
-    # Set EMBEDDING_PROVIDER=faiss and EMBEDDING_DATA_DIR=/path/to/data for production
-    embedding_provider = get_embedding_provider()
-    print(f"Initialized embedding provider with {len(embedding_provider.get_available_words())} words")
+    # Initialize semantic provider (Datamuse) for true semantic similarity
+    # This is always available and is the primary mode
+    semantic_provider = get_datamuse_provider()
+    print("Initialized semantic provider (Datamuse API)")
+
+    # Try to initialize contextual provider (FAISS/GloVe) for distributional similarity
+    # This is optional - requires EMBEDDING_PROVIDER=faiss and EMBEDDING_DATA_DIR
+    try:
+        contextual_provider = get_embedding_provider()
+        print(f"Initialized contextual provider with {len(contextual_provider.get_available_words())} words")
+    except Exception as e:
+        print(f"Contextual provider not available: {e}")
+        print("Contextual mode will be disabled - semantic mode still available")
+        contextual_provider = None
 
     yield
 
     # Cleanup
-    embedding_provider = None
+    contextual_provider = None
+    semantic_provider = None
 
 
 app = FastAPI(
@@ -82,10 +94,10 @@ async def root():
 @app.get("/words")
 async def list_words():
     """List all available words in the vocabulary."""
-    if not embedding_provider:
+    if not contextual_provider:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    return {"words": embedding_provider.get_available_words()}
+    return {"words": contextual_provider.get_available_words()}
 
 
 @app.get(
@@ -100,12 +112,31 @@ async def explore_word(
     word: Annotated[str, Query(description="Word to explore")],
     sense: Annotated[str | None, Query(description="Specific sense to use")] = None,
     limit: Annotated[int, Query(ge=1, le=500, description="Max neighbors to return")] = 100,
+    mode: Annotated[str, Query(description="Search mode: 'semantic' (synonyms) or 'contextual' (co-occurrence)")] = "semantic",
+    layout: Annotated[str, Query(description="Visualization layout: 'sectors', 'rings', 'force', or 'grid'")] = "sectors",
+    include_rare: Annotated[bool, Query(description="Include rare/uncommon words")] = False,
 ):
-    """Find semantically related words for the given input.
+    """Find related words for the given input.
+
+    Modes:
+    - semantic: True synonyms and words with similar meanings (via Datamuse)
+    - contextual: Words appearing in similar contexts (via GloVe embeddings)
+
+    Layouts (semantic mode only):
+    - sectors: Pie slices by cluster, similarity = distance from center
+    - rings: Concentric circles by similarity
+    - force: Physics simulation, same-cluster words attract
+    - grid: Distinct regions for each cluster
 
     Returns neighbors clustered by meaning with 2D coordinates for visualization.
     """
-    if not embedding_provider:
+    # Select provider based on mode
+    if mode == "semantic":
+        provider = semantic_provider
+    else:
+        provider = contextual_provider
+
+    if not provider:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     start_time = time.perf_counter()
@@ -142,11 +173,15 @@ async def explore_word(
         )
 
     # Search for the word
-    result = embedding_provider.search(normalized, sense, limit)
+    # Layout and include_rare parameters only apply to semantic mode (Datamuse provider)
+    if mode == "semantic":
+        result = provider.search(normalized, sense, limit, layout=layout, include_rare=include_rare)
+    else:
+        result = provider.search(normalized, sense, limit)
 
     if not result:
         # Word not found - check for typo
-        similar = embedding_provider.find_similar_word(normalized)
+        similar = provider.find_similar_word(normalized)
 
         if similar:
             return JSONResponse(
@@ -159,7 +194,7 @@ async def explore_word(
             )
 
         # No similar word found - provide suggestions
-        suggestions = embedding_provider.get_suggestions(3)
+        suggestions = provider.get_suggestions(3)
         return JSONResponse(
             status_code=404,
             content=ErrorResponse(
