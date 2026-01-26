@@ -83,3 +83,24 @@ class EmbeddingProvider(ABC):
     def get_available_words(self) -> list[str]:
         """Get list of all available words in vocabulary."""
         pass
+
+    def expand_cluster(
+        self,
+        word: str,
+        anchor_words: list[str],
+        limit: int = 50,
+        exclude_words: list[str] | None = None,
+    ) -> SearchResult | None:
+        """Expand a semantic cluster by fetching more words similar to anchor words.
+
+        Args:
+            word: The original query word
+            anchor_words: Representative words from the cluster to expand
+            limit: Number of additional words to fetch
+            exclude_words: Words already shown (to avoid duplicates)
+
+        Returns:
+            SearchResult with additional words, or None if not supported
+        """
+        # Default implementation returns None (not supported)
+        return None

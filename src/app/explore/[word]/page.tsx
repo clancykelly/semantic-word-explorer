@@ -6,8 +6,8 @@ import Link from "next/link";
 import { SearchInput } from "@/components/SearchInput";
 import { SensePicker } from "@/components/SensePicker";
 import { WordScatterPlot } from "@/components/WordScatterPlot";
-import { exploreWord } from "@/lib/api";
-import type { SearchState, SearchMode, LayoutType } from "@/lib/types";
+import { exploreWord, expandCluster } from "@/lib/api";
+import type { SearchState, SearchMode, LayoutType, WordNeighbor } from "@/lib/types";
 
 interface ExplorePageProps {
   params: Promise<{ word: string }>;
@@ -27,6 +27,8 @@ export default function ExplorePage({ params }: ExplorePageProps) {
   const [mode, setMode] = useState<SearchMode>("semantic");
   const [layout, setLayout] = useState<LayoutType>("sectors");
   const [includeRare, setIncludeRare] = useState<boolean>(false);
+  const [expandedClusters, setExpandedClusters] = useState<Record<number, WordNeighbor[]>>({});
+  const [expandingCluster, setExpandingCluster] = useState<number | null>(null);
 
   // Fetch word data
   const fetchWord = useCallback(
@@ -116,6 +118,53 @@ export default function ExplorePage({ params }: ExplorePageProps) {
     },
     []
   );
+
+  // Handle cluster expansion
+  const handleExpandCluster = useCallback(
+    async (clusterId: number) => {
+      if (!state.data || expandingCluster !== null) {
+        return;
+      }
+
+      // Get anchor words from this cluster (top 5 most similar)
+      const clusterWords = state.data.neighbors
+        .filter((n) => n.cluster === clusterId)
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, 5)
+        .map((n) => n.word);
+
+      if (clusterWords.length === 0) {
+        return;
+      }
+
+      // Get all currently shown words to exclude
+      const excludeWords = state.data.neighbors.map((n) => n.word);
+
+      setExpandingCluster(clusterId);
+
+      const result = await expandCluster(
+        decodedWord,
+        clusterWords,
+        excludeWords,
+        30
+      );
+
+      setExpandingCluster(null);
+
+      if (result.success && result.data.neighbors.length > 0) {
+        setExpandedClusters((prev) => ({
+          ...prev,
+          [clusterId]: result.data.neighbors,
+        }));
+      }
+    },
+    [state.data, decodedWord, expandingCluster]
+  );
+
+  // Reset expanded clusters when word changes
+  useEffect(() => {
+    setExpandedClusters({});
+  }, [decodedWord]);
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-zinc-50 to-white dark:from-zinc-950 dark:to-zinc-900">
@@ -342,20 +391,83 @@ export default function ExplorePage({ params }: ExplorePageProps) {
               </p>
             </div>
 
-            {/* Legend */}
+            {/* Legend with expand buttons */}
             <div className="flex flex-wrap justify-center gap-4 text-sm">
-              {state.data.clusters.map((cluster) => (
-                <div key={cluster.id} className="flex items-center gap-2">
-                  <span
-                    className="w-3 h-3 rounded-full"
-                    style={{ backgroundColor: cluster.color }}
-                  />
-                  <span className="text-zinc-600 dark:text-zinc-400">
-                    {cluster.label}
-                  </span>
-                </div>
-              ))}
+              {state.data.clusters.map((cluster) => {
+                const isExpanded = expandedClusters[cluster.id]?.length > 0;
+                const isExpanding = expandingCluster === cluster.id;
+
+                return (
+                  <div key={cluster.id} className="flex items-center gap-2">
+                    <span
+                      className="w-3 h-3 rounded-full"
+                      style={{ backgroundColor: cluster.color }}
+                    />
+                    <span className="text-zinc-600 dark:text-zinc-400">
+                      {cluster.label}
+                    </span>
+                    {mode === "semantic" && (
+                      <button
+                        onClick={() => handleExpandCluster(cluster.id)}
+                        disabled={isExpanding || isExpanded}
+                        className={`ml-1 px-2 py-0.5 text-xs rounded-full transition-colors ${
+                          isExpanding
+                            ? "bg-indigo-100 dark:bg-indigo-900/30 text-indigo-400 cursor-wait"
+                            : isExpanded
+                            ? "bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400"
+                            : "bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 hover:text-indigo-600 dark:hover:text-indigo-400"
+                        }`}
+                        title={isExpanded ? "Cluster expanded" : "Load more words from this cluster"}
+                      >
+                        {isExpanding ? "..." : isExpanded ? `+${expandedClusters[cluster.id].length}` : "+"}
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
             </div>
+
+            {/* Expanded cluster words */}
+            {Object.keys(expandedClusters).length > 0 && (
+              <div className="mt-6 p-4 bg-indigo-50 dark:bg-indigo-900/20 rounded-xl border-2 border-indigo-200 dark:border-indigo-800">
+                <h3 className="text-sm font-semibold text-indigo-700 dark:text-indigo-300 mb-3">
+                  Expanded Results (click a word to explore)
+                </h3>
+                <div className="space-y-3">
+                  {state.data.clusters.map((cluster) => {
+                    const expanded = expandedClusters[cluster.id];
+                    if (!expanded?.length) return null;
+
+                    return (
+                      <div key={cluster.id} className="flex flex-wrap items-center gap-2">
+                        <span
+                          className="w-2 h-2 rounded-full flex-shrink-0"
+                          style={{ backgroundColor: cluster.color }}
+                        />
+                        <span className="text-xs text-zinc-500 dark:text-zinc-400 mr-1">
+                          {cluster.label}:
+                        </span>
+                        {expanded.map((neighbor) => (
+                          <button
+                            key={neighbor.word}
+                            onClick={() => handleWordClick(neighbor.word)}
+                            className="px-2 py-0.5 text-xs rounded-full
+                              bg-white dark:bg-zinc-700
+                              text-zinc-700 dark:text-zinc-300
+                              border border-zinc-200 dark:border-zinc-600
+                              hover:border-indigo-300 dark:hover:border-indigo-500
+                              hover:text-indigo-600 dark:hover:text-indigo-400
+                              transition-colors"
+                          >
+                            {neighbor.word}
+                          </button>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </main>

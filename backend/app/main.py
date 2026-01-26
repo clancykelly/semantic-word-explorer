@@ -43,9 +43,18 @@ async def lifespan(app: FastAPI):
     try:
         contextual_provider = get_embedding_provider()
         print(f"Initialized contextual provider with {len(contextual_provider.get_available_words())} words")
+
+        # If FAISS provider is available, share its embeddings with Datamuse
+        # for semantic clustering (grouping words by meaning)
+        if hasattr(contextual_provider, 'embeddings') and hasattr(contextual_provider, 'word2idx'):
+            semantic_provider.set_embeddings(
+                contextual_provider.embeddings,
+                contextual_provider.word2idx
+            )
     except Exception as e:
         print(f"Contextual provider not available: {e}")
         print("Contextual mode will be disabled - semantic mode still available")
+        print("Semantic clustering will fall back to part-of-speech grouping")
         contextual_provider = None
 
     yield
@@ -111,7 +120,7 @@ async def list_words():
 async def explore_word(
     word: Annotated[str, Query(description="Word to explore")],
     sense: Annotated[str | None, Query(description="Specific sense to use")] = None,
-    limit: Annotated[int, Query(ge=1, le=500, description="Max neighbors to return")] = 100,
+    limit: Annotated[int, Query(ge=1, le=500, description="Max neighbors to return")] = 150,
     mode: Annotated[str, Query(description="Search mode: 'semantic' (synonyms) or 'contextual' (co-occurrence)")] = "semantic",
     layout: Annotated[str, Query(description="Visualization layout: 'sectors', 'rings', 'force', or 'grid'")] = "sectors",
     include_rare: Annotated[bool, Query(description="Include rare/uncommon words")] = False,
@@ -237,6 +246,128 @@ async def explore_word(
                 WordSense(sense=s.sense, label=s.label, frequency=s.frequency)
                 for s in result.available_senses
             ],
+        ),
+        neighbors=neighbors,
+        clusters=clusters,
+        meta=MetaInfo(
+            total_results=len(neighbors),
+            query_time_ms=query_time_ms,
+        ),
+    )
+
+
+@app.get(
+    "/expand-cluster",
+    response_model=ExploreResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid input"},
+        404: {"model": ErrorResponse, "description": "No results found"},
+    },
+)
+async def expand_cluster(
+    word: Annotated[str, Query(description="Original query word")],
+    anchor_words: Annotated[str, Query(description="Comma-separated anchor words from cluster")],
+    limit: Annotated[int, Query(ge=1, le=100, description="Max additional words")] = 50,
+    exclude: Annotated[str | None, Query(description="Comma-separated words to exclude")] = None,
+):
+    """Expand a semantic cluster to fetch more related words.
+
+    Given anchor words that represent a cluster (e.g., words from the "movement"
+    sense of "run"), fetches additional words from that same semantic neighborhood.
+
+    This enables drill-down exploration of polysemous words - first see the
+    overview of all senses, then expand the sense you're interested in.
+    """
+    if not semantic_provider:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    start_time = time.perf_counter()
+
+    # Parse and normalize anchor words
+    anchors = [normalize_word(w) for w in anchor_words.split(",")]
+    anchors = [w for w in anchors if w]  # Filter out empty after normalization
+    if not anchors:
+        return JSONResponse(
+            status_code=400,
+            content=ErrorResponse(
+                error="At least one valid anchor word is required",
+                type=ErrorType.INVALID_INPUT,
+            ).model_dump(),
+        )
+
+    # Validate anchor word count
+    if len(anchors) > 10:
+        return JSONResponse(
+            status_code=400,
+            content=ErrorResponse(
+                error="Maximum 10 anchor words allowed",
+                type=ErrorType.INVALID_INPUT,
+            ).model_dump(),
+        )
+
+    # Parse and normalize exclude words
+    exclude_list = []
+    if exclude:
+        exclude_list = [normalize_word(w) for w in exclude.split(",")]
+        exclude_list = [w for w in exclude_list if w]
+
+    # Normalize the query word
+    normalized_word = normalize_word(word)
+    if not normalized_word:
+        return JSONResponse(
+            status_code=400,
+            content=ErrorResponse(
+                error="Please enter a valid word",
+                type=ErrorType.INVALID_INPUT,
+            ).model_dump(),
+        )
+
+    # Expand the cluster
+    result = semantic_provider.expand_cluster(
+        word=normalized_word,
+        anchor_words=anchors,
+        limit=limit,
+        exclude_words=exclude_list,
+    )
+
+    if not result or not result.neighbors:
+        return JSONResponse(
+            status_code=404,
+            content=ErrorResponse(
+                error="No additional words found for this cluster",
+                type=ErrorType.NOT_FOUND,
+            ).model_dump(),
+        )
+
+    query_time_ms = int((time.perf_counter() - start_time) * 1000)
+
+    neighbors = [
+        WordNeighbor(
+            word=n.word,
+            similarity=n.similarity,
+            coordinates=Coordinates(x=n.coordinates[0], y=n.coordinates[1]),
+            frequency=FrequencyTier(n.frequency),
+            cluster=n.cluster,
+        )
+        for n in result.neighbors
+    ]
+
+    clusters = [
+        Cluster(
+            id=c["id"],
+            label=c["label"],
+            color=c["color"],
+            centroid=Coordinates(x=c["centroid"]["x"], y=c["centroid"]["y"]),
+        )
+        for c in result.clusters
+    ]
+
+    return ExploreResponse(
+        query=QueryInfo(
+            word=word,
+            normalized_word=result.normalized_word,
+            sense=None,
+            available_senses=[],
         ),
         neighbors=neighbors,
         clusters=clusters,
