@@ -667,8 +667,9 @@ class DatamuseProvider(EmbeddingProvider):
         )
         assignments = [int(x) for x in ac.fit_predict(dist)]
 
-        # Merge small clusters that are close to each other
-        assignments = self._merge_small_clusters(assignments, dist, min_size=8)
+        # Merge small clusters — scale min_size to dataset size
+        adaptive_min_size = max(3, n_words // (optimal_k * 2))
+        assignments = self._merge_small_clusters(assignments, dist, min_size=adaptive_min_size)
 
         n_final = len(set(assignments))
 
@@ -952,9 +953,13 @@ class DatamuseProvider(EmbeddingProvider):
                 similarity = float(np.dot(query_norm, vec_norm))
             elif " " in word:
                 # Multi-word phrase - compute average embedding of component words
+                # EXCLUDE the query word itself to avoid inflated similarity
+                # (e.g., "run out" scored only on "out", not "run")
                 component_vecs = []
                 for component in word.split():
                     component = component.lower()
+                    if component == query_lower:
+                        continue  # Skip query word in phrase
                     if component in self._word2idx:
                         idx = self._word2idx[component]
                         component_vecs.append(self._embeddings[idx])
@@ -985,7 +990,7 @@ class DatamuseProvider(EmbeddingProvider):
     def _find_adaptive_threshold(
         self,
         similarities: list[float],
-        min_threshold: float = 0.32,
+        min_threshold: float = 0.20,
         max_threshold: float = 0.55,
         min_keep: int = 40,
     ) -> float:
@@ -1064,14 +1069,16 @@ class DatamuseProvider(EmbeddingProvider):
             print(f"Using relevance threshold: {threshold:.3f}")
 
         # Filter by threshold with tiered approach:
-        # - Curated sources (Datamuse synonyms, Moby) get base threshold
-        # - Uncurated ML results need higher threshold to filter geographic/tangential words
-        ml_threshold = max(threshold + 0.10, 0.42)  # Stricter for ML-only results
+        # - Datamuse synonyms (rel_syn): always kept (high-quality curated)
+        # - Moby / ConceptNet: lower floor (0.25) but still filtered
+        # - Uncurated ML results need higher threshold to filter tangential words
+        ml_threshold = max(threshold + 0.05, 0.30)  # Stricter for ML-only results
+        curated_threshold = max(threshold - 0.05, 0.15)  # Floor for Moby / ConceptNet single words
 
         # Phrases need higher similarity threshold since average embeddings are noisier
         phrase_threshold = max(threshold, 0.55)
-        # Moby Thesaurus phrases get lower threshold since it's a curated source
-        moby_phrase_threshold = max(threshold, 0.30)
+        # Curated phrases get a lower but non-zero threshold
+        curated_phrase_threshold = 0.30
 
         filtered = []
         for candidate, sim in scored:
@@ -1079,23 +1086,24 @@ class DatamuseProvider(EmbeddingProvider):
             is_synonym = "syn" in tags  # Datamuse explicit synonym
             is_moby = "moby" in tags    # From Moby Thesaurus
             is_conceptnet = "conceptnet" in tags  # From ConceptNet
-            is_curated = is_synonym or is_moby or is_conceptnet
             word = candidate.get("word", "")
             is_phrase = " " in word
 
+            # Datamuse synonyms are always kept (high-quality)
+            if is_synonym:
+                candidate["_relevance"] = sim
+                filtered.append(candidate)
+                continue
+
             # Determine the effective threshold for this candidate
             if is_phrase:
-                # Moby phrases get lower threshold since they're curated
-                effective_threshold = moby_phrase_threshold if is_moby else phrase_threshold
-            elif is_curated:
-                # Curated single words use base threshold
-                effective_threshold = threshold
+                effective_threshold = curated_phrase_threshold if (is_moby or is_conceptnet) else phrase_threshold
+            elif is_moby or is_conceptnet:
+                effective_threshold = curated_threshold
             else:
-                # Uncurated ML results need higher similarity
                 effective_threshold = ml_threshold
 
-            # Always keep curated sources (Datamuse synonyms, Moby Thesaurus, ConceptNet)
-            if is_synonym or is_moby or is_conceptnet or sim >= effective_threshold:
+            if sim >= effective_threshold:
                 # Store the relevance score for later use
                 candidate["_relevance"] = sim
                 filtered.append(candidate)
@@ -1194,6 +1202,26 @@ class DatamuseProvider(EmbeddingProvider):
         needs_sampling = len(results) > limit
         word_texts = [w.get("word", "").lower() for w in results]
 
+        # Ensure single-word diversity: reserve slots for single words
+        # This prevents phrases from dominating the results
+        single_word_indices = [i for i, w in enumerate(word_texts) if " " not in w]
+        phrase_indices = [i for i, w in enumerate(word_texts) if " " in w]
+
+        min_single_words = min(limit // 2, len(single_word_indices))  # At least half should be single words
+        if needs_sampling and len(single_word_indices) > min_single_words:
+            # Prioritize single words, then fill with phrases
+            priority_indices = single_word_indices[:min_single_words]
+            remaining_singles = single_word_indices[min_single_words:]
+            remaining_slots = limit - min_single_words
+            # Mix remaining singles and phrases
+            other_indices = remaining_singles + phrase_indices
+            priority_indices.extend(other_indices[:remaining_slots])
+            # Rebuild results in this order
+            priority_indices = sorted(set(priority_indices))
+            results = [results[i] for i in priority_indices]
+            word_texts = [w.get("word", "").lower() for w in results]
+            needs_sampling = len(results) > limit
+
         if len(word_texts) < 5:
             if len(results) <= limit:
                 return results, None, None
@@ -1207,8 +1235,10 @@ class DatamuseProvider(EmbeddingProvider):
         )
         cluster_assignments = [int(x) for x in ac.fit_predict(dist)]
 
-        # Merge small clusters into nearest neighbors
-        cluster_assignments = self._merge_small_clusters(cluster_assignments, dist, min_size=8)
+        # Merge small clusters — scale min_size to dataset so small result sets
+        # don't collapse into a single cluster
+        adaptive_min_size = max(3, len(word_texts) // (actual_n_clusters * 2))
+        cluster_assignments = self._merge_small_clusters(cluster_assignments, dist, min_size=adaptive_min_size)
 
         # Build cluster -> indices mapping
         clusters: dict[int, list[int]] = {}
