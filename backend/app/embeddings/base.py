@@ -13,6 +13,7 @@ class WordResult:
     coordinates: tuple[float, float]
     frequency: str  # "common", "uncommon", "rare"
     cluster: int
+    formality: float  # 0.0 = casual, 1.0 = formal
 
 
 @dataclass

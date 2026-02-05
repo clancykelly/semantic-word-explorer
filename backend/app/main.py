@@ -124,6 +124,7 @@ async def explore_word(
     mode: Annotated[str, Query(description="Search mode: 'semantic' (synonyms) or 'contextual' (co-occurrence)")] = "semantic",
     layout: Annotated[str, Query(description="Visualization layout: 'sectors', 'rings', 'force', or 'grid'")] = "sectors",
     include_rare: Annotated[bool, Query(description="Include rare/uncommon words")] = False,
+    relevance: Annotated[float | None, Query(ge=0.0, le=1.0, description="Relevance threshold (0.0-1.0). None=adaptive. Higher=stricter.")] = None,
 ):
     """Find related words for the given input.
 
@@ -136,6 +137,12 @@ async def explore_word(
     - rings: Concentric circles by similarity
     - force: Physics simulation, same-cluster words attract
     - grid: Distinct regions for each cluster
+
+    Relevance (semantic mode only):
+    - None (default): Adaptive threshold based on score distribution
+    - 0.2: Loose - more related words, some noise
+    - 0.3: Moderate - good balance
+    - 0.4+: Strict - only close synonyms
 
     Returns neighbors clustered by meaning with 2D coordinates for visualization.
     """
@@ -182,9 +189,12 @@ async def explore_word(
         )
 
     # Search for the word
-    # Layout and include_rare parameters only apply to semantic mode (Datamuse provider)
+    # Layout, include_rare, and relevance parameters only apply to semantic mode
     if mode == "semantic":
-        result = provider.search(normalized, sense, limit, layout=layout, include_rare=include_rare)
+        result = provider.search(
+            normalized, sense, limit,
+            layout=layout, include_rare=include_rare, relevance=relevance
+        )
     else:
         result = provider.search(normalized, sense, limit)
 
@@ -223,6 +233,7 @@ async def explore_word(
             coordinates=Coordinates(x=n.coordinates[0], y=n.coordinates[1]),
             frequency=FrequencyTier(n.frequency),
             cluster=n.cluster,
+            formality=n.formality,
         )
         for n in result.neighbors
     ]
@@ -348,6 +359,7 @@ async def expand_cluster(
             coordinates=Coordinates(x=n.coordinates[0], y=n.coordinates[1]),
             frequency=FrequencyTier(n.frequency),
             cluster=n.cluster,
+            formality=n.formality,
         )
         for n in result.neighbors
     ]

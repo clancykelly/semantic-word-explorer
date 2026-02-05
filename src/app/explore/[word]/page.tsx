@@ -6,8 +6,11 @@ import Link from "next/link";
 import { SearchInput } from "@/components/SearchInput";
 import { SensePicker } from "@/components/SensePicker";
 import { WordScatterPlot } from "@/components/WordScatterPlot";
+import { ClusterListView } from "@/components/ClusterListView";
 import { exploreWord, expandCluster } from "@/lib/api";
 import type { SearchState, SearchMode, LayoutType, WordNeighbor } from "@/lib/types";
+
+type ViewMode = "graph" | "list";
 
 interface ExplorePageProps {
   params: Promise<{ word: string }>;
@@ -27,15 +30,17 @@ export default function ExplorePage({ params }: ExplorePageProps) {
   const [mode, setMode] = useState<SearchMode>("semantic");
   const [layout, setLayout] = useState<LayoutType>("sectors");
   const [includeRare, setIncludeRare] = useState<boolean>(false);
+  const [relevance, setRelevance] = useState<number | null>(null); // null = adaptive
+  const [viewMode, setViewMode] = useState<ViewMode>("graph");
   const [expandedClusters, setExpandedClusters] = useState<Record<number, WordNeighbor[]>>({});
   const [expandingCluster, setExpandingCluster] = useState<number | null>(null);
 
   // Fetch word data
   const fetchWord = useCallback(
-    async (searchWord: string, sense: string | undefined, searchMode: SearchMode, searchLayout: LayoutType, searchIncludeRare: boolean) => {
+    async (searchWord: string, sense: string | undefined, searchMode: SearchMode, searchLayout: LayoutType, searchIncludeRare: boolean, searchRelevance: number | null) => {
       setState((prev) => ({ ...prev, status: "loading", error: null }));
 
-      const result = await exploreWord(searchWord, sense, searchMode, searchLayout, searchIncludeRare);
+      const result = await exploreWord(searchWord, sense, searchMode, searchLayout, searchIncludeRare, searchRelevance);
 
       if (result.success) {
         setState({
@@ -58,18 +63,18 @@ export default function ExplorePage({ params }: ExplorePageProps) {
     []
   );
 
-  // Initial load and mode/layout/includeRare change
+  // Initial load and mode/layout/includeRare/relevance change
   useEffect(() => {
-    void fetchWord(decodedWord, selectedSense || undefined, mode, layout, includeRare);
-  }, [decodedWord, mode, layout, includeRare, fetchWord, selectedSense]);
+    void fetchWord(decodedWord, selectedSense || undefined, mode, layout, includeRare, relevance);
+  }, [decodedWord, mode, layout, includeRare, relevance, fetchWord, selectedSense]);
 
   // Handle sense change
   const handleSenseChange = useCallback(
     (sense: string) => {
       setSelectedSense(sense);
-      fetchWord(decodedWord, sense, mode, layout, includeRare);
+      fetchWord(decodedWord, sense, mode, layout, includeRare, relevance);
     },
-    [decodedWord, fetchWord, mode, layout, includeRare]
+    [decodedWord, fetchWord, mode, layout, includeRare, relevance]
   );
 
   // Handle mode change
@@ -108,8 +113,8 @@ export default function ExplorePage({ params }: ExplorePageProps) {
 
   // Handle retry
   const handleRetry = useCallback(() => {
-    fetchWord(decodedWord, selectedSense || undefined, mode, layout, includeRare);
-  }, [decodedWord, selectedSense, fetchWord, mode, layout, includeRare]);
+    fetchWord(decodedWord, selectedSense || undefined, mode, layout, includeRare, relevance);
+  }, [decodedWord, selectedSense, fetchWord, mode, layout, includeRare, relevance]);
 
   // Handle include rare toggle
   const handleIncludeRareChange = useCallback(
@@ -247,6 +252,66 @@ export default function ExplorePage({ params }: ExplorePageProps) {
               </span>
             </label>
           )}
+
+          {/* Relevance Slider (semantic mode only) */}
+          {mode === "semantic" && (
+            <div className="flex items-center gap-2" title="Filter by relevance to query word. Auto=adaptive threshold.">
+              <span className="text-sm text-zinc-600 dark:text-zinc-400 whitespace-nowrap">
+                Relevance:
+              </span>
+              <select
+                value={relevance === null ? "auto" : relevance.toString()}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setRelevance(val === "auto" ? null : parseFloat(val));
+                }}
+                className="px-2 py-1 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700
+                  bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300
+                  focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              >
+                <option value="auto">Auto</option>
+                <option value="0.2">Loose (0.2)</option>
+                <option value="0.3">Moderate (0.3)</option>
+                <option value="0.4">Strict (0.4)</option>
+                <option value="0.5">Very Strict (0.5)</option>
+              </select>
+            </div>
+          )}
+
+          {/* View Mode Toggle */}
+          <div className="flex items-center gap-1 p-1 bg-zinc-100 dark:bg-zinc-800 rounded-lg">
+            <button
+              onClick={() => setViewMode("graph")}
+              className={`p-1.5 rounded transition-all ${
+                viewMode === "graph"
+                  ? "bg-white dark:bg-zinc-700 text-indigo-600 dark:text-indigo-400 shadow-sm"
+                  : "text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+              }`}
+              title="Graph view"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="2" strokeWidth={2} />
+                <circle cx="6" cy="6" r="2" strokeWidth={2} />
+                <circle cx="18" cy="6" r="2" strokeWidth={2} />
+                <circle cx="6" cy="18" r="2" strokeWidth={2} />
+                <circle cx="18" cy="18" r="2" strokeWidth={2} />
+                <path strokeLinecap="round" strokeWidth={1.5} d="M12 10V8M10 12H8M14 12h2M12 14v2M7.5 7.5l3 3M16.5 7.5l-3 3M7.5 16.5l3-3M16.5 16.5l-3-3" />
+              </svg>
+            </button>
+            <button
+              onClick={() => setViewMode("list")}
+              className={`p-1.5 rounded transition-all ${
+                viewMode === "list"
+                  ? "bg-white dark:bg-zinc-700 text-indigo-600 dark:text-indigo-400 shadow-sm"
+                  : "text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+              }`}
+              title="List view"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+              </svg>
+            </button>
+          </div>
         </div>
       </header>
 
@@ -375,60 +440,71 @@ export default function ExplorePage({ params }: ExplorePageProps) {
             </div>
 
             {/* Visualization */}
-            <WordScatterPlot
-              neighbors={state.data.neighbors}
-              clusters={state.data.clusters}
-              queryWord={state.data.query.normalizedWord}
-              onWordClick={handleWordClick}
-            />
+            {viewMode === "graph" ? (
+              <>
+                <WordScatterPlot
+                  neighbors={state.data.neighbors}
+                  clusters={state.data.clusters}
+                  queryWord={state.data.query.normalizedWord}
+                  onWordClick={handleWordClick}
+                />
 
-            {/* Instructions */}
-            <div className="text-center text-sm text-zinc-500 dark:text-zinc-400">
-              <p>
-                <strong>Click</strong> a word to explore it •{" "}
-                <strong>Hover</strong> for details •{" "}
-                <strong>Scroll</strong> to zoom • <strong>Drag</strong> to pan
-              </p>
-            </div>
+                {/* Instructions */}
+                <div className="text-center text-sm text-zinc-500 dark:text-zinc-400">
+                  <p>
+                    <strong>Click</strong> a word to explore it •{" "}
+                    <strong>Hover</strong> for details •{" "}
+                    <strong>Scroll</strong> to zoom • <strong>Drag</strong> to pan
+                  </p>
+                </div>
 
-            {/* Legend with expand buttons */}
-            <div className="flex flex-wrap justify-center gap-4 text-sm">
-              {state.data.clusters.map((cluster) => {
-                const isExpanded = expandedClusters[cluster.id]?.length > 0;
-                const isExpanding = expandingCluster === cluster.id;
+                {/* Legend with expand buttons */}
+                <div className="flex flex-wrap justify-center gap-4 text-sm">
+                  {state.data.clusters.map((cluster) => {
+                    const isExpanded = expandedClusters[cluster.id]?.length > 0;
+                    const isExpanding = expandingCluster === cluster.id;
 
-                return (
-                  <div key={cluster.id} className="flex items-center gap-2">
-                    <span
-                      className="w-3 h-3 rounded-full"
-                      style={{ backgroundColor: cluster.color }}
-                    />
-                    <span className="text-zinc-600 dark:text-zinc-400">
-                      {cluster.label}
-                    </span>
-                    {mode === "semantic" && (
-                      <button
-                        onClick={() => handleExpandCluster(cluster.id)}
-                        disabled={isExpanding || isExpanded}
-                        className={`ml-1 px-2 py-0.5 text-xs rounded-full transition-colors ${
-                          isExpanding
-                            ? "bg-indigo-100 dark:bg-indigo-900/30 text-indigo-400 cursor-wait"
-                            : isExpanded
-                            ? "bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400"
-                            : "bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 hover:text-indigo-600 dark:hover:text-indigo-400"
-                        }`}
-                        title={isExpanded ? "Cluster expanded" : "Load more words from this cluster"}
-                      >
-                        {isExpanding ? "..." : isExpanded ? `+${expandedClusters[cluster.id].length}` : "+"}
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
+                    return (
+                      <div key={cluster.id} className="flex items-center gap-2">
+                        <span
+                          className="w-3 h-3 rounded-full"
+                          style={{ backgroundColor: cluster.color }}
+                        />
+                        <span className="text-zinc-600 dark:text-zinc-400">
+                          {cluster.label}
+                        </span>
+                        {mode === "semantic" && (
+                          <button
+                            onClick={() => handleExpandCluster(cluster.id)}
+                            disabled={isExpanding || isExpanded}
+                            className={`ml-1 px-2 py-0.5 text-xs rounded-full transition-colors ${
+                              isExpanding
+                                ? "bg-indigo-100 dark:bg-indigo-900/30 text-indigo-400 cursor-wait"
+                                : isExpanded
+                                ? "bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400"
+                                : "bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 hover:text-indigo-600 dark:hover:text-indigo-400"
+                            }`}
+                            title={isExpanded ? "Cluster expanded" : "Load more words from this cluster"}
+                          >
+                            {isExpanding ? "..." : isExpanded ? `+${expandedClusters[cluster.id].length}` : "+"}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            ) : (
+              <ClusterListView
+                neighbors={state.data.neighbors}
+                clusters={state.data.clusters}
+                queryWord={state.data.query.normalizedWord}
+                onWordClick={handleWordClick}
+              />
+            )}
 
-            {/* Expanded cluster words */}
-            {Object.keys(expandedClusters).length > 0 && (
+            {/* Expanded cluster words (only in graph view) */}
+            {viewMode === "graph" && Object.keys(expandedClusters).length > 0 && (
               <div className="mt-6 p-4 bg-indigo-50 dark:bg-indigo-900/20 rounded-xl border-2 border-indigo-200 dark:border-indigo-800">
                 <h3 className="text-sm font-semibold text-indigo-700 dark:text-indigo-300 mb-3">
                   Expanded Results (click a word to explore)

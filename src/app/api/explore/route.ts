@@ -22,6 +22,7 @@ interface PythonExploreResponse {
     coordinates: { x: number; y: number };
     frequency: string;
     cluster: number;
+    formality: number;
   }>;
   clusters: Array<{
     id: number;
@@ -78,6 +79,7 @@ export async function GET(request: NextRequest) {
   const mode = searchParams.get("mode") || "semantic";
   const layout = searchParams.get("layout") || "sectors";
   const includeRare = searchParams.get("includeRare") === "true";
+  const relevance = searchParams.get("relevance");
 
   // Build URL for Python backend
   const backendParams = new URLSearchParams();
@@ -86,6 +88,7 @@ export async function GET(request: NextRequest) {
   backendParams.set("mode", mode);
   backendParams.set("layout", layout);
   backendParams.set("include_rare", includeRare ? "true" : "false");
+  if (relevance) backendParams.set("relevance", relevance);
 
   try {
     const response = await fetch(

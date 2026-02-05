@@ -409,6 +409,7 @@ export function getMockExploreResponse(
       similarity: n.similarity,
       frequency: n.frequency,
       cluster: n.cluster,
+      formality: 0.5, // Mock data default
       coordinates: {
         x: clusterDef.centroid.x + n.offsetX,
         y: clusterDef.centroid.y + n.offsetY,
@@ -423,6 +424,7 @@ export function getMockExploreResponse(
     similarity: 1.0,
     frequency: "common",
     cluster: 0,
+    formality: 0.5,
     coordinates: {
       x: queryCentroid.x,
       y: queryCentroid.y,

@@ -30,11 +30,48 @@ export function WordScatterPlot({
 }: WordScatterPlotProps) {
   // Group neighbors by cluster for coloring
   const traceData = useMemo(() => {
-    // Create a trace for each cluster
-    return clusters.map((cluster) => {
+    const traces: Plotly.Data[] = [];
+
+    // Find the query word to get its coordinates (center point)
+    const queryNeighbor = neighbors.find(
+      (n) => n.word.toLowerCase() === queryWord.toLowerCase()
+    );
+    const centerX = queryNeighbor?.coordinates.x ?? 0.5;
+    const centerY = queryNeighbor?.coordinates.y ?? 0.5;
+
+    // Create individual link traces - one per neighbor for distinct styling
+    // Each line gets its own width and opacity based on similarity
+    neighbors.forEach((n) => {
+      if (n.word.toLowerCase() === queryWord.toLowerCase()) return;
+
+      const cluster = clusters.find((c) => c.id === n.cluster);
+      if (!cluster) return;
+
+      // Line width: 1 to 6 based on similarity (more dramatic range)
+      const width = 1 + n.similarity * 5;
+      // Opacity: 0.15 to 0.6 based on similarity
+      const opacity = 0.15 + n.similarity * 0.45;
+
+      traces.push({
+        type: "scattergl",
+        mode: "lines",
+        x: [n.coordinates.x, centerX],
+        y: [n.coordinates.y, centerY],
+        line: {
+          color: cluster.color,
+          width: width,
+        },
+        opacity: opacity,
+        hoverinfo: "skip",
+        showlegend: false,
+      } as unknown as Plotly.Data);
+    });
+
+    // Create a trace for each cluster (points on top of lines)
+    clusters.forEach((cluster) => {
       const clusterNeighbors = neighbors.filter((n) => n.cluster === cluster.id);
 
-      return {
+      traces.push({
         type: "scattergl",
         mode: "text+markers",
         name: cluster.label,
@@ -75,8 +112,10 @@ export function WordScatterPlot({
           "Similarity: %{customdata.similarity:.0%}<br>" +
           "Frequency: %{customdata.frequency}<br>" +
           "<extra></extra>",
-      } as unknown as Plotly.Data;
+      } as unknown as Plotly.Data);
     });
+
+    return traces;
   }, [neighbors, clusters, queryWord]);
 
   const layout = useMemo(

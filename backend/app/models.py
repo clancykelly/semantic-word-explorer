@@ -29,6 +29,7 @@ class WordNeighbor(BaseModel):
     coordinates: Coordinates
     frequency: FrequencyTier
     cluster: int = Field(..., ge=0)
+    formality: float = Field(..., ge=0, le=1, description="0.0=casual, 1.0=formal")
 
 
 class Cluster(BaseModel):

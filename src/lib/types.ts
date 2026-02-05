@@ -17,6 +17,7 @@ export interface WordNeighbor {
   coordinates: Coordinates;
   frequency: FrequencyTier;
   cluster: number;
+  formality: number; // 0.0 = casual, 1.0 = formal
 }
 
 export interface Cluster {

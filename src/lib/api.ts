@@ -9,7 +9,8 @@ export async function exploreWord(
   sense?: string,
   mode: SearchMode = "semantic",
   layout: LayoutType = "sectors",
-  includeRare: boolean = false
+  includeRare: boolean = false,
+  relevance: number | null = null
 ): Promise<ApiResult> {
   try {
     const params = new URLSearchParams({ word, mode, layout });
@@ -18,6 +19,9 @@ export async function exploreWord(
     }
     if (includeRare) {
       params.set("includeRare", "true");
+    }
+    if (relevance !== null) {
+      params.set("relevance", relevance.toString());
     }
 
     const response = await fetch(`/api/explore?${params.toString()}`);

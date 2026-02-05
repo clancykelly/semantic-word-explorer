@@ -22,6 +22,7 @@ interface PythonExploreResponse {
     coordinates: { x: number; y: number };
     frequency: string;
     cluster: number;
+    formality: number;
   }>;
   clusters: Array<{
     id: number;

@@ -52,6 +52,72 @@ POS_LABELS = {
     "u": "unknown",
 }
 
+# Formal suffixes (Latin/Greek origins, academic register)
+FORMAL_SUFFIXES = (
+    "tion", "sion", "ment", "ity", "ness", "ance", "ence", "ious", "eous",
+    "ical", "ology", "istic", "ism", "ist", "ive", "ary", "ory", "al", "ure",
+)
+
+# Casual/informal markers
+CASUAL_WORDS = frozenset({
+    "gonna", "wanna", "gotta", "kinda", "sorta", "yeah", "yep", "nope",
+    "stuff", "thing", "things", "guy", "guys", "cool", "awesome", "okay",
+    "ok", "hey", "hi", "bye", "wow", "oops", "ugh", "huh", "yay", "nah",
+})
+
+
+def compute_formality(word: str) -> float:
+    """Compute a formality score for a word (0.0 = casual, 1.0 = formal).
+
+    Uses heuristics based on:
+    - Word length (longer words tend to be more formal)
+    - Syllable count approximation
+    - Latin/Greek suffixes (more formal)
+    - Known casual words (less formal)
+    """
+    word_lower = word.lower().strip()
+
+    # Handle phrases - average formality of components
+    if " " in word_lower:
+        parts = word_lower.split()
+        if not parts:
+            return 0.5
+        return sum(compute_formality(p) for p in parts) / len(parts)
+
+    # Known casual words
+    if word_lower in CASUAL_WORDS:
+        return 0.1
+
+    # Base score from word length (normalized 3-12 chars to 0.3-0.7)
+    length_score = min(1.0, max(0.0, (len(word_lower) - 3) / 9)) * 0.4 + 0.3
+
+    # Syllable approximation (count vowel groups)
+    vowels = "aeiouy"
+    syllables = 0
+    prev_vowel = False
+    for char in word_lower:
+        is_vowel = char in vowels
+        if is_vowel and not prev_vowel:
+            syllables += 1
+        prev_vowel = is_vowel
+    syllables = max(1, syllables)
+
+    # Syllable bonus (more syllables = more formal, normalized 1-5 to 0-0.2)
+    syllable_bonus = min(0.2, max(0.0, (syllables - 1) / 4) * 0.2)
+
+    # Formal suffix bonus
+    suffix_bonus = 0.0
+    for suffix in FORMAL_SUFFIXES:
+        if word_lower.endswith(suffix) and len(word_lower) > len(suffix) + 2:
+            suffix_bonus = 0.15
+            break
+
+    # Combine scores
+    formality = length_score + syllable_bonus + suffix_bonus
+
+    # Clamp to 0-1
+    return min(1.0, max(0.0, formality))
+
 
 class DatamuseProvider(EmbeddingProvider):
     """Embedding provider using Datamuse API for semantic similarity.
@@ -897,15 +963,40 @@ class DatamuseProvider(EmbeddingProvider):
 
         return clusters, None  # No custom labels for POS-based clustering
 
-    def _get_frequency_tier(self, score: int, max_score: int) -> str:
-        """Determine frequency tier based on score."""
-        if max_score == 0:
+    def _get_frequency_tier(self, word_data: dict) -> str:
+        """Determine frequency tier based on Datamuse frequency tag.
+
+        Uses the f: tag from Datamuse metadata, which represents
+        word frequency per million words in a large corpus.
+        """
+        tags = word_data.get("tags", [])
+
+        # Extract frequency from f: tag
+        freq = None
+        for tag in tags:
+            if tag.startswith("f:"):
+                try:
+                    freq = float(tag[2:])
+                except ValueError:
+                    pass
+                break
+
+        # Curated sources (Moby, ConceptNet) are treated as common
+        is_curated = "moby" in tags or "conceptnet" in tags or "syn" in tags
+        if is_curated:
             return "common"
 
-        ratio = score / max_score
-        if ratio > 0.5:
+        # No frequency data - assume common
+        if freq is None:
             return "common"
-        elif ratio > 0.2:
+
+        # Datamuse frequency is per million words
+        # Common words: freq > 10 (appears 10+ times per million)
+        # Uncommon: 1-10
+        # Rare: < 1
+        if freq > 10:
+            return "common"
+        elif freq > 1:
             return "uncommon"
         else:
             return "rare"
@@ -945,12 +1036,15 @@ class DatamuseProvider(EmbeddingProvider):
             word = candidate.get("word", "").lower()
             is_synonym = "syn" in candidate.get("tags", [])
 
+            has_embedding = False
+
             if word in self._word2idx:
                 # Single word with embedding
                 idx = self._word2idx[word]
                 vec = self._embeddings[idx]
                 vec_norm = vec / (np.linalg.norm(vec) + 1e-8)
                 similarity = float(np.dot(query_norm, vec_norm))
+                has_embedding = True
             elif " " in word:
                 # Multi-word phrase - compute average embedding of component words
                 # EXCLUDE the query word itself to avoid inflated similarity
@@ -969,6 +1063,7 @@ class DatamuseProvider(EmbeddingProvider):
                     avg_vec = np.mean(component_vecs, axis=0)
                     avg_norm = avg_vec / (np.linalg.norm(avg_vec) + 1e-8)
                     similarity = float(np.dot(query_norm, avg_norm))
+                    has_embedding = True
                 elif is_synonym:
                     # Phrase with no known components but marked as synonym - trust it
                     similarity = 0.5
@@ -981,6 +1076,8 @@ class DatamuseProvider(EmbeddingProvider):
             else:
                 # No embedding - give benefit of doubt with moderate score
                 similarity = 0.25
+
+            candidate["_has_embedding"] = has_embedding
             scored.append((candidate, similarity))
 
         # Sort by similarity descending
@@ -1089,7 +1186,23 @@ class DatamuseProvider(EmbeddingProvider):
             word = candidate.get("word", "")
             is_phrase = " " in word
 
-            # Datamuse synonyms are always kept (high-quality)
+            has_embedding = candidate.get("_has_embedding", True)
+
+            # Words not in GloVe vocabulary (archaic/rare) need special handling
+            # They get default scores (0.5 for synonyms, 0.25 otherwise) which aren't reliable
+            if not has_embedding:
+                # Datamuse synonyms without embeddings: keep only if explicitly marked
+                # (these are modern-enough words that Datamuse knows about)
+                if is_synonym:
+                    candidate["_relevance"] = sim
+                    filtered.append(candidate)
+                    continue
+                # Moby/ConceptNet words without GloVe embeddings: likely archaic, skip them
+                # This filters out "duodecimo" and similar obscure entries
+                else:
+                    continue
+
+            # Datamuse synonyms with embeddings are always kept (high-quality)
             if is_synonym:
                 candidate["_relevance"] = sim
                 filtered.append(candidate)
@@ -1474,23 +1587,28 @@ class DatamuseProvider(EmbeddingProvider):
                 coordinates=(0.5, 0.5),
                 frequency="common",
                 cluster=0,
+                formality=compute_formality(normalized),
             )
         )
 
         for i, result in enumerate(results):
             result_word = result.get("word", "")
-            score = result.get("score", 0)
 
-            # Normalize similarity score to 0-1 range
-            similarity = score / max_score if max_score > 0 else 0
+            # Use GloVe relevance for similarity (determines font weight in UI)
+            # This is more meaningful than Datamuse score (which is 0 for synonyms)
+            relevance = result.get("_relevance", 0.5)
+
+            # Cap at 1.0 and ensure reasonable display range
+            similarity = min(1.0, relevance)
 
             neighbors.append(
                 WordResult(
                     word=result_word,
                     similarity=round(similarity, 3),
                     coordinates=coordinates[i] if i < len(coordinates) else (0.5, 0.5),
-                    frequency=self._get_frequency_tier(score, max_score),
+                    frequency=self._get_frequency_tier(result),
                     cluster=cluster_assignments[i] if i < len(cluster_assignments) else 0,
+                    formality=compute_formality(result_word),
                 )
             )
 
@@ -1649,8 +1767,9 @@ class DatamuseProvider(EmbeddingProvider):
                     word=result_word,
                     similarity=round(similarity, 3),
                     coordinates=coordinates[i] if i < len(coordinates) else (0.5, 0.5),
-                    frequency=self._get_frequency_tier(score, max_score),
+                    frequency=self._get_frequency_tier(result),
                     cluster=cluster_assignments[i] if i < len(cluster_assignments) else 0,
+                    formality=compute_formality(result_word),
                 )
             )
 
