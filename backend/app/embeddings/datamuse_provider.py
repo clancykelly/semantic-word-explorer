@@ -4,10 +4,11 @@ This provider uses the Datamuse API to find words with similar meanings,
 providing true semantic similarity rather than distributional similarity.
 """
 
+import hashlib
 import math
 import random
 import time
-from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -15,16 +16,16 @@ import numpy as np
 
 from .base import EmbeddingProvider, SearchResult, SenseInfo, WordResult
 from .moby_thesaurus import get_moby_thesaurus
+from .vectors import WordVectors
 
 # Try to import sklearn for clustering
 try:
-    from sklearn.cluster import AgglomerativeClustering, KMeans
+    from sklearn.cluster import AgglomerativeClustering
     from sklearn.metrics import silhouette_score
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
     AgglomerativeClustering = None
-    KMeans = None
     silhouette_score = None
 
 # Cluster color palette - supports up to 12 clusters
@@ -130,32 +131,25 @@ class DatamuseProvider(EmbeddingProvider):
     words by meaning rather than just part of speech).
     """
 
-    def __init__(self):
+    def __init__(self, use_conceptnet: bool = False):
         self.api_base = "https://api.datamuse.com/words"
-        # Cache for spell checking suggestions
-        self._suggestion_cache: dict[str, list[str]] = {}
-        # Optional embeddings for semantic clustering
-        self._embeddings: np.ndarray | None = None
-        self._word2idx: dict[str, int] | None = None
-        # ConceptNet cache: (word, rel_type) -> (timestamp, results)
+        # Static word vectors (Model2Vec) for relevance + clustering. Optional.
+        self._vectors: WordVectors | None = None
+        # ConceptNet is a flaky, slow source (two 10s network calls); off by
+        # default. Enable with DatamuseProvider(use_conceptnet=True).
+        self.use_conceptnet = use_conceptnet
         self._conceptnet_cache: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
         self._conceptnet_cache_ttl: float = 3600.0  # 1 hour
 
-    def set_embeddings(self, embeddings: np.ndarray, word2idx: dict[str, int]) -> None:
-        """Set GloVe embeddings for semantic clustering.
-
-        Args:
-            embeddings: (N, D) numpy array of word embeddings
-            word2idx: Dict mapping word -> index in embeddings array
-        """
-        self._embeddings = embeddings
-        self._word2idx = word2idx
-        print(f"DatamuseProvider: Enabled semantic clustering with {len(word2idx)} word vectors")
+    def set_vectors(self, vectors: WordVectors) -> None:
+        """Set the static word-vector model for relevance scoring + clustering."""
+        self._vectors = vectors
+        print(f"DatamuseProvider: semantic vectors enabled ({vectors.model_name}, dim {vectors.dim})")
 
     def _fetch_from_api(self, params: dict[str, str]) -> list[dict[str, Any]]:
         """Fetch results from Datamuse API."""
         try:
-            with httpx.Client(timeout=10.0) as client:
+            with httpx.Client(timeout=6.0) as client:
                 response = client.get(self.api_base, params=params)
                 response.raise_for_status()
                 return response.json()
@@ -337,7 +331,7 @@ class DatamuseProvider(EmbeddingProvider):
         if not words:
             return []
 
-        random.seed(hash(query_word))
+        random.seed(int(hashlib.md5(query_word.encode("utf-8")).hexdigest()[:8], 16))
 
         if layout == "sectors":
             coords = self._layout_sectors(words, clusters)
@@ -592,78 +586,18 @@ class DatamuseProvider(EmbeddingProvider):
 
         return coordinates
 
-    def _build_distance_matrix(
-        self,
-        word_texts: list[str],
-        glove_weight: float = 0.5,
-    ) -> tuple[np.ndarray, int]:
-        """Build a combined distance matrix from GloVe cosine + Moby Jaccard similarity.
+    def _build_distance_matrix(self, word_texts: list[str]) -> np.ndarray:
+        """Pairwise cosine-distance matrix from the static word vectors.
 
-        For word pairs where both signals exist, blends them. Where only one
-        signal exists, uses that signal alone. Where neither exists, uses
-        maximum distance.
-
-        Args:
-            word_texts: Lowercased word strings
-            glove_weight: Weight for GloVe similarity (1 - glove_weight for Moby)
-
-        Returns:
-            Tuple of (distance matrix, number of words with at least one signal)
+        Vectorized as a single matmul. Falls back to all-equidistant when no
+        vectors are configured.
         """
         n = len(word_texts)
-        moby = get_moby_thesaurus()
-
-        # Precompute Moby synonym sets
-        moby_sets: list[set[str]] = []
-        for w in word_texts:
-            syns = set(s.lower() for s in moby.get_synonyms(w))
-            moby_sets.append(syns)
-
-        # Precompute GloVe vectors (normalized)
-        glove_vecs: list[np.ndarray | None] = []
-        for w in word_texts:
-            if w in self._word2idx:
-                v = self._embeddings[self._word2idx[w]].astype(np.float32)
-                norm = np.linalg.norm(v)
-                glove_vecs.append(v / norm if norm > 0 else v)
-            elif " " in w:
-                parts = [self._embeddings[self._word2idx[p]] for p in w.split() if p in self._word2idx]
-                if parts:
-                    v = np.mean(parts, axis=0).astype(np.float32)
-                    norm = np.linalg.norm(v)
-                    glove_vecs.append(v / norm if norm > 0 else v)
-                else:
-                    glove_vecs.append(None)
-            else:
-                glove_vecs.append(None)
-
-        # Build pairwise distance matrix
-        dist = np.ones((n, n), dtype=np.float32)
-        np.fill_diagonal(dist, 0.0)
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                has_glove = glove_vecs[i] is not None and glove_vecs[j] is not None
-                has_moby = bool(moby_sets[i]) and bool(moby_sets[j])
-
-                if has_glove and has_moby:
-                    glove_sim = float(np.dot(glove_vecs[i], glove_vecs[j]))
-                    union = moby_sets[i] | moby_sets[j]
-                    moby_sim = len(moby_sets[i] & moby_sets[j]) / len(union) if union else 0.0
-                    sim = glove_weight * glove_sim + (1 - glove_weight) * moby_sim
-                elif has_glove:
-                    sim = float(np.dot(glove_vecs[i], glove_vecs[j]))
-                elif has_moby:
-                    union = moby_sets[i] | moby_sets[j]
-                    sim = len(moby_sets[i] & moby_sets[j]) / len(union) if union else 0.0
-                else:
-                    sim = 0.0
-
-                d = max(0.0, 1.0 - sim)
-                dist[i, j] = d
-                dist[j, i] = d
-
-        return dist
+        if self._vectors is None:
+            dist = np.ones((n, n), dtype=np.float32)
+            np.fill_diagonal(dist, 0.0)
+            return dist
+        return self._vectors.distance_matrix([w.lower() for w in word_texts])
 
     def _find_optimal_clusters(
         self,
@@ -715,7 +649,7 @@ class DatamuseProvider(EmbeddingProvider):
         Returns:
             Tuple of (cluster assignments, cluster labels)
         """
-        if not SKLEARN_AVAILABLE or self._embeddings is None or self._word2idx is None:
+        if not SKLEARN_AVAILABLE or self._vectors is None:
             return None, None
 
         word_texts = [w.get("word", "").lower() for w in words]
@@ -797,53 +731,6 @@ class DatamuseProvider(EmbeddingProvider):
         remap = {old: new for new, old in enumerate(unique)}
         return [remap[c] for c in assignments]
 
-    def _assign_oov_words(
-        self,
-        words: list[dict[str, Any]],
-        word_texts: list[str],
-        assignments: list[int],
-        n_clusters: int,
-    ) -> None:
-        """Assign out-of-vocabulary words to clusters via Moby co-synonym majority vote.
-
-        For each unassigned word, finds its Moby co-synonyms that ARE in the result
-        set and assigns it to the majority cluster of those co-synonyms.
-        Falls back to the largest cluster if no co-synonyms are found.
-
-        Modifies assignments in place.
-        """
-        unassigned = [i for i, a in enumerate(assignments) if a == -1]
-        if not unassigned:
-            return
-
-        moby = get_moby_thesaurus()
-
-        # Build lookup: word -> cluster assignment (for words already assigned)
-        word_to_cluster = {}
-        for i, a in enumerate(assignments):
-            if a >= 0:
-                word_to_cluster[word_texts[i].lower()] = a
-
-        # Find largest cluster as fallback
-        cluster_sizes = Counter(a for a in assignments if a >= 0)
-        fallback_cluster = cluster_sizes.most_common(1)[0][0] if cluster_sizes else 0
-
-        for i in unassigned:
-            word_lower = word_texts[i].lower()
-            # Get this word's Moby co-synonyms
-            oov_synonyms = set(s.lower() for s in moby.get_synonyms(word_lower))
-
-            # Find which clusters those co-synonyms belong to
-            co_synonym_clusters = []
-            for syn in oov_synonyms:
-                if syn in word_to_cluster:
-                    co_synonym_clusters.append(word_to_cluster[syn])
-
-            if co_synonym_clusters:
-                assignments[i] = Counter(co_synonym_clusters).most_common(1)[0][0]
-            else:
-                assignments[i] = fallback_cluster
-
     def _generate_cluster_labels(
         self,
         words: list[dict[str, Any]],
@@ -890,21 +777,6 @@ class DatamuseProvider(EmbeddingProvider):
 
         return labels
 
-    def _get_pos_cluster(self, word_data: dict[str, Any]) -> int:
-        """Get cluster ID based on part of speech (fallback)."""
-        tags = word_data.get("tags", [])
-        pos_tags = {"n", "v", "adj", "adv"}
-
-        for tag in tags:
-            if tag in pos_tags:
-                if tag == "n":
-                    return 1
-                elif tag == "adj":
-                    return 2
-                elif tag == "v":
-                    return 3
-        return 4  # Other
-
     def _assign_clusters(
         self,
         words: list[dict[str, Any]],
@@ -928,7 +800,7 @@ class DatamuseProvider(EmbeddingProvider):
             return precomputed_assignments, precomputed_labels
 
         # Try semantic clustering
-        if self._embeddings is not None:
+        if self._vectors is not None:
             assignments, labels = self._cluster_by_embeddings(words, query_word=query_word)
             if assignments is not None:
                 return assignments, labels
@@ -1016,71 +888,18 @@ class DatamuseProvider(EmbeddingProvider):
             List of (word_data, similarity) tuples, sorted by similarity descending.
             Words without embeddings get similarity of 0.0.
         """
-        if self._embeddings is None or self._word2idx is None:
-            # No embeddings - return all with similarity 1.0 (no filtering)
+        if self._vectors is None:
+            # No vectors - return all with similarity 1.0 (no filtering)
             return [(c, 1.0) for c in candidates]
 
-        query_lower = query_word.lower()
-        if query_lower not in self._word2idx:
-            # Query word not in vocabulary - return all with similarity 1.0
-            return [(c, 1.0) for c in candidates]
+        words = [c.get("word", "").lower() for c in candidates]
+        sims = self._vectors.similarities(query_word.lower(), words)
 
-        # Get query vector
-        query_idx = self._word2idx[query_lower]
-        query_vec = self._embeddings[query_idx]
-        query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
-
-        # Score each candidate
         scored = []
-        for candidate in candidates:
-            word = candidate.get("word", "").lower()
-            is_synonym = "syn" in candidate.get("tags", [])
+        for candidate, sim in zip(candidates, sims):
+            candidate["_has_embedding"] = True
+            scored.append((candidate, float(sim)))
 
-            has_embedding = False
-
-            if word in self._word2idx:
-                # Single word with embedding
-                idx = self._word2idx[word]
-                vec = self._embeddings[idx]
-                vec_norm = vec / (np.linalg.norm(vec) + 1e-8)
-                similarity = float(np.dot(query_norm, vec_norm))
-                has_embedding = True
-            elif " " in word:
-                # Multi-word phrase - compute average embedding of component words
-                # EXCLUDE the query word itself to avoid inflated similarity
-                # (e.g., "run out" scored only on "out", not "run")
-                component_vecs = []
-                for component in word.split():
-                    component = component.lower()
-                    if component == query_lower:
-                        continue  # Skip query word in phrase
-                    if component in self._word2idx:
-                        idx = self._word2idx[component]
-                        component_vecs.append(self._embeddings[idx])
-
-                if component_vecs:
-                    # Average the component embeddings
-                    avg_vec = np.mean(component_vecs, axis=0)
-                    avg_norm = avg_vec / (np.linalg.norm(avg_vec) + 1e-8)
-                    similarity = float(np.dot(query_norm, avg_norm))
-                    has_embedding = True
-                elif is_synonym:
-                    # Phrase with no known components but marked as synonym - trust it
-                    similarity = 0.5
-                else:
-                    # Unknown phrase - low score
-                    similarity = 0.2
-            elif is_synonym:
-                # Explicit synonym without embedding - trust Datamuse
-                similarity = 0.5
-            else:
-                # No embedding - give benefit of doubt with moderate score
-                similarity = 0.25
-
-            candidate["_has_embedding"] = has_embedding
-            scored.append((candidate, similarity))
-
-        # Sort by similarity descending
         scored.sort(key=lambda x: -x[1])
         return scored
 
@@ -1307,7 +1126,7 @@ class DatamuseProvider(EmbeddingProvider):
         Returns:
             Tuple of (sampled_results, cluster_assignments, cluster_labels)
         """
-        if not SKLEARN_AVAILABLE or self._embeddings is None or self._word2idx is None:
+        if not SKLEARN_AVAILABLE or self._vectors is None:
             if len(results) <= limit:
                 return results, None, None
             return results[:limit], None, None
@@ -1449,12 +1268,20 @@ class DatamuseProvider(EmbeddingProvider):
         # Datamuse can return up to 1000 results - fetch more for better clustering
         fetch_limit = max(limit * 4, 500)
 
-        # First, fetch explicit synonyms (these are always good)
-        synonyms = self._fetch_from_api({
-            "rel_syn": normalized,
-            "max": str(min(fetch_limit, 300)),
-            "md": "fp",
-        })
+        # Fetch explicit synonyms (rel_syn) and "means like" (ml) concurrently.
+        # rel_syn is occasionally very slow on Datamuse's side; running it next to
+        # ml keeps it off the critical path (each has its own short timeout).
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_syn = pool.submit(
+                self._fetch_from_api,
+                {"rel_syn": normalized, "max": str(min(fetch_limit, 300)), "md": "fp"},
+            )
+            f_ml = pool.submit(
+                self._fetch_from_api,
+                {"ml": normalized, "max": str(min(fetch_limit, 1000)), "md": "fp"},
+            )
+            synonyms = f_syn.result()
+            ml_results = f_ml.result()
 
         # Mark all synonym results with "syn" tag
         synonym_words = set()
@@ -1464,14 +1291,6 @@ class DatamuseProvider(EmbeddingProvider):
             if "tags" not in syn:
                 syn["tags"] = []
             syn["tags"].append("syn")
-
-        # Also fetch "means like" results for broader coverage
-        # Use higher limit to capture more senses of polysemous words
-        ml_results = self._fetch_from_api({
-            "ml": normalized,
-            "max": str(min(fetch_limit, 1000)),
-            "md": "fp",
-        })
 
         # Combine: synonyms first, then ml results (avoiding duplicates)
         results = list(synonyms)
@@ -1515,7 +1334,7 @@ class DatamuseProvider(EmbeddingProvider):
             print(f"Moby Thesaurus: {moby_added} new words, {moby_tagged} existing words tagged")
 
         # Add results from ConceptNet (Synonym + RelatedTo edges)
-        conceptnet_candidates = self._fetch_from_conceptnet(normalized)
+        conceptnet_candidates = self._fetch_from_conceptnet(normalized) if self.use_conceptnet else []
         conceptnet_added = 0
         conceptnet_tagged = 0
         for cn_word in conceptnet_candidates:
@@ -1552,7 +1371,7 @@ class DatamuseProvider(EmbeddingProvider):
             return None
 
         # Filter by frequency (get more than limit to allow smart sampling)
-        frequency_limit = limit * 3 if self._embeddings is not None else limit
+        frequency_limit = limit * 3 if self._vectors is not None else limit
         results = self._filter_by_frequency(
             results, include_rare=include_rare, limit=frequency_limit, rare_bonus=150
         )
@@ -1699,48 +1518,17 @@ class DatamuseProvider(EmbeddingProvider):
         if not all_candidates:
             return None
 
-        # If we have embeddings, filter to words closest to anchor centroid
-        if self._embeddings is not None and self._word2idx is not None:
-            # Compute anchor centroid
-            anchor_vectors = []
-            for anchor in anchor_words:
-                anchor_lower = anchor.lower()
-                if anchor_lower in self._word2idx:
-                    idx = self._word2idx[anchor_lower]
-                    anchor_vectors.append(self._embeddings[idx])
+        # If we have vectors, filter to words closest to the anchor centroid
+        if self._vectors is not None and anchor_words:
+            anchor_vecs = self._vectors.encode([a.lower() for a in anchor_words])
+            centroid = anchor_vecs.mean(axis=0)
+            centroid = centroid / (np.linalg.norm(centroid) + 1e-8)
 
-            if anchor_vectors:
-                centroid = np.mean(anchor_vectors, axis=0)
-                centroid = centroid / (np.linalg.norm(centroid) + 1e-8)
-
-                # Score candidates by similarity to centroid
-                scored_candidates = []
-                for candidate in all_candidates:
-                    w = candidate.get("word", "").lower()
-                    vec = None
-
-                    if w in self._word2idx:
-                        # Single word with embedding
-                        idx = self._word2idx[w]
-                        vec = self._embeddings[idx]
-                    elif " " in w:
-                        # Multi-word phrase - compute average embedding
-                        component_vecs = []
-                        for component in w.split():
-                            if component in self._word2idx:
-                                idx = self._word2idx[component]
-                                component_vecs.append(self._embeddings[idx])
-                        if component_vecs:
-                            vec = np.mean(component_vecs, axis=0)
-
-                    if vec is not None:
-                        vec_norm = vec / (np.linalg.norm(vec) + 1e-8)
-                        similarity = float(np.dot(centroid, vec_norm))
-                        scored_candidates.append((similarity, candidate))
-
-                # Sort by similarity and take top results
-                scored_candidates.sort(key=lambda x: -x[0])
-                all_candidates = [c for _, c in scored_candidates[:limit * 2]]
+            cand_words = [c.get("word", "").lower() for c in all_candidates]
+            cand_vecs = self._vectors.encode(cand_words)
+            sims = cand_vecs @ centroid
+            order = np.argsort(-sims)
+            all_candidates = [all_candidates[i] for i in order[: limit * 2]]
 
         # Take the requested limit
         results = all_candidates[:limit]
@@ -1752,15 +1540,17 @@ class DatamuseProvider(EmbeddingProvider):
         cluster_assignments, custom_labels = self._assign_clusters(results, query_word=normalized)
         coordinates = self._compute_coordinates(results, cluster_assignments, normalized, "force")
 
-        max_score = max((r.get("score", 0) for r in results), default=1)
-        if max_score == 0:
-            max_score = 1
+        # Similarity = cosine to the query word (consistent with the main view)
+        result_words = [r.get("word", "") for r in results]
+        if self._vectors is not None:
+            sims = self._vectors.similarities(normalized, [w.lower() for w in result_words])
+        else:
+            sims = [0.5] * len(results)
 
         neighbors = []
         for i, result in enumerate(results):
             result_word = result.get("word", "")
-            score = result.get("score", 0)
-            similarity = score / max_score if max_score > 0 else 0
+            similarity = max(0.0, min(1.0, float(sims[i])))
 
             neighbors.append(
                 WordResult(

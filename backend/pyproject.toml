@@ -8,15 +8,14 @@ dependencies = [
     "uvicorn[standard]>=0.27.0",
     "pydantic>=2.5.0",
     "numpy>=1.26.0",
-    "python-Levenshtein>=0.23.0",
     "httpx>=0.26.0",
 ]
 
 [project.optional-dependencies]
+# Semantic clustering + static word vectors for relevance/clustering.
 ml = [
-    "faiss-cpu>=1.7.4",
-    "umap-learn>=0.5.5",
     "scikit-learn>=1.4.0",
+    "model2vec>=0.3.0",
 ]
 dev = [
     "pytest>=7.4.0",

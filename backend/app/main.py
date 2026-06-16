@@ -1,5 +1,6 @@
 """FastAPI application for Semantic Word Explorer."""
 
+import os
 import re
 import time
 from contextlib import asynccontextmanager
@@ -9,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .embeddings import EmbeddingProvider, get_embedding_provider, get_datamuse_provider
+from .embeddings import DatamuseProvider, get_datamuse_provider, load_word_vectors
 from .models import (
     Cluster,
     Coordinates,
@@ -23,45 +24,29 @@ from .models import (
     WordSense,
 )
 
-# Global embedding provider instances
-contextual_provider: EmbeddingProvider | None = None  # FAISS/GloVe for contextual similarity
-semantic_provider: EmbeddingProvider | None = None    # Datamuse for semantic similarity
+# Single semantic provider (Datamuse), optionally backed by static word vectors.
+provider: DatamuseProvider | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup resources."""
-    global contextual_provider, semantic_provider
+    global provider
 
-    # Initialize semantic provider (Datamuse) for true semantic similarity
-    # This is always available and is the primary mode
-    semantic_provider = get_datamuse_provider()
+    provider = get_datamuse_provider()
     print("Initialized semantic provider (Datamuse API)")
 
-    # Try to initialize contextual provider (FAISS/GloVe) for distributional similarity
-    # This is optional - requires EMBEDDING_PROVIDER=faiss and EMBEDDING_DATA_DIR
-    try:
-        contextual_provider = get_embedding_provider()
-        print(f"Initialized contextual provider with {len(contextual_provider.get_available_words())} words")
-
-        # If FAISS provider is available, share its embeddings with Datamuse
-        # for semantic clustering (grouping words by meaning)
-        if hasattr(contextual_provider, 'embeddings') and hasattr(contextual_provider, 'word2idx'):
-            semantic_provider.set_embeddings(
-                contextual_provider.embeddings,
-                contextual_provider.word2idx
-            )
-    except Exception as e:
-        print(f"Contextual provider not available: {e}")
-        print("Contextual mode will be disabled - semantic mode still available")
-        print("Semantic clustering will fall back to part-of-speech grouping")
-        contextual_provider = None
+    # Load static word vectors (Model2Vec) for relevance filtering + clustering.
+    # Optional: without them, clustering falls back to part-of-speech grouping.
+    vectors = load_word_vectors()
+    if vectors is not None:
+        provider.set_vectors(vectors)
+    else:
+        print("Word vectors unavailable; clustering will fall back to part-of-speech grouping")
 
     yield
 
-    # Cleanup
-    contextual_provider = None
-    semantic_provider = None
+    provider = None
 
 
 app = FastAPI(
@@ -71,14 +56,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Configure CORS for frontend access
+# Configure CORS for frontend access (override origins via CORS_ORIGINS env var)
+_default_origins = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001"
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=[o.strip() for o in os.getenv("CORS_ORIGINS", _default_origins).split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["GET"],
     allow_headers=["*"],
@@ -100,15 +82,6 @@ async def root():
     }
 
 
-@app.get("/words")
-async def list_words():
-    """List all available words in the vocabulary."""
-    if not contextual_provider:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-
-    return {"words": contextual_provider.get_available_words()}
-
-
 @app.get(
     "/explore",
     response_model=ExploreResponse,
@@ -117,41 +90,27 @@ async def list_words():
         404: {"model": ErrorResponse, "description": "Word not found"},
     },
 )
-async def explore_word(
+def explore_word(
     word: Annotated[str, Query(description="Word to explore")],
     sense: Annotated[str | None, Query(description="Specific sense to use")] = None,
     limit: Annotated[int, Query(ge=1, le=500, description="Max neighbors to return")] = 150,
-    mode: Annotated[str, Query(description="Search mode: 'semantic' (synonyms) or 'contextual' (co-occurrence)")] = "semantic",
-    layout: Annotated[str, Query(description="Visualization layout: 'sectors', 'rings', 'force', or 'grid'")] = "sectors",
+    layout: Annotated[str, Query(description="Visualization layout: 'sectors' or 'force'")] = "sectors",
     include_rare: Annotated[bool, Query(description="Include rare/uncommon words")] = False,
-    relevance: Annotated[float | None, Query(ge=0.0, le=1.0, description="Relevance threshold (0.0-1.0). None=adaptive. Higher=stricter.")] = None,
+    relevance: Annotated[
+        float | None,
+        Query(ge=0.0, le=1.0, description="Relevance threshold (0.0-1.0). None=adaptive. Higher=stricter."),
+    ] = None,
 ):
-    """Find related words for the given input.
-
-    Modes:
-    - semantic: True synonyms and words with similar meanings (via Datamuse)
-    - contextual: Words appearing in similar contexts (via GloVe embeddings)
-
-    Layouts (semantic mode only):
-    - sectors: Pie slices by cluster, similarity = distance from center
-    - rings: Concentric circles by similarity
-    - force: Physics simulation, same-cluster words attract
-    - grid: Distinct regions for each cluster
-
-    Relevance (semantic mode only):
-    - None (default): Adaptive threshold based on score distribution
-    - 0.2: Loose - more related words, some noise
-    - 0.3: Moderate - good balance
-    - 0.4+: Strict - only close synonyms
+    """Find semantically related words for the given input.
 
     Returns neighbors clustered by meaning with 2D coordinates for visualization.
-    """
-    # Select provider based on mode
-    if mode == "semantic":
-        provider = semantic_provider
-    else:
-        provider = contextual_provider
 
+    Relevance:
+    - None (default): adaptive threshold based on score distribution
+    - 0.2: loose (more related words, some noise)
+    - 0.3: moderate
+    - 0.4+: strict (only close synonyms)
+    """
     if not provider:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
@@ -189,14 +148,10 @@ async def explore_word(
         )
 
     # Search for the word
-    # Layout, include_rare, and relevance parameters only apply to semantic mode
-    if mode == "semantic":
-        result = provider.search(
-            normalized, sense, limit,
-            layout=layout, include_rare=include_rare, relevance=relevance
-        )
-    else:
-        result = provider.search(normalized, sense, limit)
+    result = provider.search(
+        normalized, sense, limit,
+        layout=layout, include_rare=include_rare, relevance=relevance,
+    )
 
     if not result:
         # Word not found - check for typo
@@ -275,7 +230,7 @@ async def explore_word(
         404: {"model": ErrorResponse, "description": "No results found"},
     },
 )
-async def expand_cluster(
+def expand_cluster(
     word: Annotated[str, Query(description="Original query word")],
     anchor_words: Annotated[str, Query(description="Comma-separated anchor words from cluster")],
     limit: Annotated[int, Query(ge=1, le=100, description="Max additional words")] = 50,
@@ -289,7 +244,7 @@ async def expand_cluster(
     This enables drill-down exploration of polysemous words - first see the
     overview of all senses, then expand the sense you're interested in.
     """
-    if not semantic_provider:
+    if not provider:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     start_time = time.perf_counter()
@@ -334,7 +289,7 @@ async def expand_cluster(
         )
 
     # Expand the cluster
-    result = semantic_provider.expand_cluster(
+    result = provider.expand_cluster(
         word=normalized_word,
         anchor_words=anchors,
         limit=limit,
