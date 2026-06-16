@@ -40,5 +40,7 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# backend data files (large embeddings)
+# backend data files (large embeddings / generated vectors)
 backend/data/
+backend/embedding_data/
+backend/.venv/

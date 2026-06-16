@@ -1,36 +1,76 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Semantic Word Explorer
 
-## Getting Started
+A writer's thesaurus that goes beyond synonyms. Enter a word and explore the
+*neighborhood* of related vocabulary — clustered by meaning, weighted by
+similarity, and tagged by register — as an interactive graph or a clustered list.
+Built for discovering unexpected, rare, and conceptually connected words that a
+traditional synonym list misses.
 
-First, run the development server:
+## How it works
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+- **Frontend** — Next.js (App Router, TypeScript, Tailwind). Search a word, then
+  see related words as a Plotly scatter graph or a clustered list. Click any word
+  to explore onward; polysemous words offer a sense picker, and any cluster can be
+  expanded for more words from that corner of meaning.
+- **Backend** — FastAPI. Gathers candidate words from the
+  [Datamuse API](https://www.datamuse.com/api/) (synonyms + "means like", fetched
+  concurrently) and the Moby Thesaurus, then uses static word vectors to (a) score
+  each candidate's relevance to the query and (b) cluster the results by meaning
+  (agglomerative clustering over a vectorized cosine-distance matrix).
+- **Word vectors** — [Model2Vec](https://github.com/MinishLab/model2vec)
+  (`potion-base-8M`, a distilled static model that encodes *any* word on demand,
+  including rare ones), with an on-disk GloVe table as an offline fallback.
+
+## Architecture
+
+```
+Next.js (frontend)              FastAPI (backend)
+  /explore/[word]      ──►        GET /explore
+  graph + list views              ├─ Datamuse (rel_syn + ml, concurrent)
+  sense picker                    ├─ Moby Thesaurus
+  cluster expansion               └─ static vectors (Model2Vec / GloVe table)
+                                       relevance scoring + agglomerative clustering
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Running locally
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Backend
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+cd backend
+python -m venv .venv
+.venv/bin/pip install -e ".[ml]"        # or: uv sync
+.venv/bin/python -m uvicorn app.main:app --reload --port 8000
+```
 
-## Learn More
+The first start downloads the Model2Vec model (~30MB, cached afterward). If it
+isn't available, the backend falls back to an on-disk GloVe vector table (see
+`EMBEDDING_DATA_DIR`). See [`backend/README.md`](backend/README.md) for API details.
 
-To learn more about Next.js, take a look at the following resources:
+### Frontend
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+npm install
+npm run dev        # http://localhost:3000
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+The frontend proxies to the backend at `http://127.0.0.1:8000` (override with `BACKEND_URL`).
 
-## Deploy on Vercel
+## Configuration
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+| Env var | Side | Default | Purpose |
+|---|---|---|---|
+| `EMBEDDING_MODEL` | backend | `minishlab/potion-base-8M` | Model2Vec model id |
+| `EMBEDDING_DATA_DIR` | backend | `data/glove-6b-300d` | GloVe table fallback location |
+| `CORS_ORIGINS` | backend | `localhost:3000` | allowed frontend origins (comma-separated) |
+| `BACKEND_URL` | frontend | `http://127.0.0.1:8000` | backend address |
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Data files
+
+The large vector artifacts (GloVe text/`.npy`, FAISS indexes, the GloVe zip) are
+**not** committed — they're git-ignored. Model2Vec fetches its model on first run;
+the GloVe fallback table is generated/downloaded separately if you want it.
+
+## License
+
+MIT
