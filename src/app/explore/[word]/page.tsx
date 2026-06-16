@@ -8,7 +8,7 @@ import { SensePicker } from "@/components/SensePicker";
 import { WordScatterPlot } from "@/components/WordScatterPlot";
 import { ClusterListView } from "@/components/ClusterListView";
 import { exploreWord, expandCluster } from "@/lib/api";
-import type { SearchState, SearchMode, LayoutType, WordNeighbor } from "@/lib/types";
+import type { SearchState, WordNeighbor } from "@/lib/types";
 
 type ViewMode = "graph" | "list";
 
@@ -27,20 +27,17 @@ export default function ExplorePage({ params }: ExplorePageProps) {
     error: null,
   });
   const [selectedSense, setSelectedSense] = useState<string | null>(null);
-  const [mode, setMode] = useState<SearchMode>("semantic");
-  const [layout, setLayout] = useState<LayoutType>("sectors");
   const [includeRare, setIncludeRare] = useState<boolean>(false);
-  const [relevance, setRelevance] = useState<number | null>(null); // null = adaptive
   const [viewMode, setViewMode] = useState<ViewMode>("graph");
   const [expandedClusters, setExpandedClusters] = useState<Record<number, WordNeighbor[]>>({});
   const [expandingCluster, setExpandingCluster] = useState<number | null>(null);
 
   // Fetch word data
   const fetchWord = useCallback(
-    async (searchWord: string, sense: string | undefined, searchMode: SearchMode, searchLayout: LayoutType, searchIncludeRare: boolean, searchRelevance: number | null) => {
+    async (searchWord: string, sense: string | undefined, searchIncludeRare: boolean) => {
       setState((prev) => ({ ...prev, status: "loading", error: null }));
 
-      const result = await exploreWord(searchWord, sense, searchMode, searchLayout, searchIncludeRare, searchRelevance);
+      const result = await exploreWord(searchWord, sense, searchIncludeRare);
 
       if (result.success) {
         setState({
@@ -63,34 +60,18 @@ export default function ExplorePage({ params }: ExplorePageProps) {
     []
   );
 
-  // Initial load and mode/layout/includeRare/relevance change
+  // Initial load and includeRare change
   useEffect(() => {
-    void fetchWord(decodedWord, selectedSense || undefined, mode, layout, includeRare, relevance);
-  }, [decodedWord, mode, layout, includeRare, relevance, fetchWord, selectedSense]);
+    void fetchWord(decodedWord, selectedSense || undefined, includeRare);
+  }, [decodedWord, includeRare, fetchWord, selectedSense]);
 
   // Handle sense change
   const handleSenseChange = useCallback(
     (sense: string) => {
       setSelectedSense(sense);
-      fetchWord(decodedWord, sense, mode, layout, includeRare, relevance);
+      fetchWord(decodedWord, sense, includeRare);
     },
-    [decodedWord, fetchWord, mode, layout, includeRare, relevance]
-  );
-
-  // Handle mode change
-  const handleModeChange = useCallback(
-    (newMode: SearchMode) => {
-      setMode(newMode);
-    },
-    []
-  );
-
-  // Handle layout change
-  const handleLayoutChange = useCallback(
-    (newLayout: LayoutType) => {
-      setLayout(newLayout);
-    },
-    []
+    [decodedWord, fetchWord, includeRare]
   );
 
   // Handle new search
@@ -113,8 +94,8 @@ export default function ExplorePage({ params }: ExplorePageProps) {
 
   // Handle retry
   const handleRetry = useCallback(() => {
-    fetchWord(decodedWord, selectedSense || undefined, mode, layout, includeRare, relevance);
-  }, [decodedWord, selectedSense, fetchWord, mode, layout, includeRare, relevance]);
+    fetchWord(decodedWord, selectedSense || undefined, includeRare);
+  }, [decodedWord, selectedSense, fetchWord, includeRare]);
 
   // Handle include rare toggle
   const handleIncludeRareChange = useCallback(
@@ -187,96 +168,24 @@ export default function ExplorePage({ params }: ExplorePageProps) {
               onSearch={handleSearch}
               isLoading={state.status === "loading"}
               initialValue={decodedWord}
-              didYouMean={state.error?.didYouMean}
-              onDidYouMeanClick={handleSearch}
             />
           </div>
-          {/* Mode Toggle */}
-          <div className="flex items-center gap-1 p-1 bg-zinc-100 dark:bg-zinc-800 rounded-full">
-            <button
-              onClick={() => handleModeChange("semantic")}
-              className={`px-4 py-1.5 rounded-full text-sm font-medium transition-all ${
-                mode === "semantic"
-                  ? "bg-white dark:bg-zinc-700 text-indigo-600 dark:text-indigo-400 shadow-sm"
-                  : "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200"
-              }`}
-              title="Find true synonyms and words with similar meanings"
-            >
-              Semantic
-            </button>
-            <button
-              onClick={() => handleModeChange("contextual")}
-              className={`px-4 py-1.5 rounded-full text-sm font-medium transition-all ${
-                mode === "contextual"
-                  ? "bg-white dark:bg-zinc-700 text-indigo-600 dark:text-indigo-400 shadow-sm"
-                  : "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200"
-              }`}
-              title="Find words that appear in similar contexts"
-            >
-              Contextual
-            </button>
-          </div>
-
-          {/* Layout Selector (semantic mode only) */}
-          {mode === "semantic" && (
-            <select
-              value={layout}
-              onChange={(e) => handleLayoutChange(e.target.value as LayoutType)}
-              className="px-3 py-1.5 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700
-                bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300
-                focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              title="Choose visualization layout"
-            >
-              <option value="sectors">Sectors</option>
-              <option value="rings">Rings</option>
-              <option value="force">Force</option>
-              <option value="grid">Grid</option>
-            </select>
-          )}
-
-          {/* Include Rare Words Toggle (semantic mode only) */}
-          {mode === "semantic" && (
-            <label
-              className="flex items-center gap-2 cursor-pointer"
-              title="Include rare and uncommon words in results"
-            >
-              <input
-                type="checkbox"
-                checked={includeRare}
-                onChange={(e) => handleIncludeRareChange(e.target.checked)}
-                className="w-4 h-4 rounded border-zinc-300 dark:border-zinc-600
-                  text-indigo-600 focus:ring-indigo-500 focus:ring-offset-0"
-              />
-              <span className="text-sm text-zinc-600 dark:text-zinc-400">
-                Rare words
-              </span>
-            </label>
-          )}
-
-          {/* Relevance Slider (semantic mode only) */}
-          {mode === "semantic" && (
-            <div className="flex items-center gap-2" title="Filter by relevance to query word. Auto=adaptive threshold.">
-              <span className="text-sm text-zinc-600 dark:text-zinc-400 whitespace-nowrap">
-                Relevance:
-              </span>
-              <select
-                value={relevance === null ? "auto" : relevance.toString()}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setRelevance(val === "auto" ? null : parseFloat(val));
-                }}
-                className="px-2 py-1 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700
-                  bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300
-                  focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              >
-                <option value="auto">Auto</option>
-                <option value="0.2">Loose (0.2)</option>
-                <option value="0.3">Moderate (0.3)</option>
-                <option value="0.4">Strict (0.4)</option>
-                <option value="0.5">Very Strict (0.5)</option>
-              </select>
-            </div>
-          )}
+          {/* Include Rare Words Toggle */}
+          <label
+            className="flex items-center gap-2 cursor-pointer"
+            title="Include rare and uncommon words in results"
+          >
+            <input
+              type="checkbox"
+              checked={includeRare}
+              onChange={(e) => handleIncludeRareChange(e.target.checked)}
+              className="w-4 h-4 rounded border-zinc-300 dark:border-zinc-600
+                text-indigo-600 focus:ring-indigo-500 focus:ring-offset-0"
+            />
+            <span className="text-sm text-zinc-600 dark:text-zinc-400">
+              Rare words
+            </span>
+          </label>
 
           {/* View Mode Toggle */}
           <div className="flex items-center gap-1 p-1 bg-zinc-100 dark:bg-zinc-800 rounded-lg">
@@ -422,21 +331,6 @@ export default function ExplorePage({ params }: ExplorePageProps) {
                 Found {state.data.meta.totalResults} related words in{" "}
                 {state.data.meta.queryTimeMs}ms
               </p>
-
-              {/* Mode description */}
-              <p className="text-xs text-zinc-400 dark:text-zinc-500 max-w-md mx-auto">
-                {mode === "semantic" ? (
-                  <>
-                    <span className="font-medium text-indigo-600 dark:text-indigo-400">Semantic mode:</span>{" "}
-                    True synonyms and words with similar meanings
-                  </>
-                ) : (
-                  <>
-                    <span className="font-medium text-indigo-600 dark:text-indigo-400">Contextual mode:</span>{" "}
-                    Words that appear in similar contexts (co-occurrence)
-                  </>
-                )}
-              </p>
             </div>
 
             {/* Visualization */}
@@ -473,22 +367,20 @@ export default function ExplorePage({ params }: ExplorePageProps) {
                         <span className="text-zinc-600 dark:text-zinc-400">
                           {cluster.label}
                         </span>
-                        {mode === "semantic" && (
-                          <button
-                            onClick={() => handleExpandCluster(cluster.id)}
-                            disabled={isExpanding || isExpanded}
-                            className={`ml-1 px-2 py-0.5 text-xs rounded-full transition-colors ${
-                              isExpanding
-                                ? "bg-indigo-100 dark:bg-indigo-900/30 text-indigo-400 cursor-wait"
-                                : isExpanded
-                                ? "bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400"
-                                : "bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 hover:text-indigo-600 dark:hover:text-indigo-400"
-                            }`}
-                            title={isExpanded ? "Cluster expanded" : "Load more words from this cluster"}
-                          >
-                            {isExpanding ? "..." : isExpanded ? `+${expandedClusters[cluster.id].length}` : "+"}
-                          </button>
-                        )}
+                        <button
+                          onClick={() => handleExpandCluster(cluster.id)}
+                          disabled={isExpanding || isExpanded}
+                          className={`ml-1 px-2 py-0.5 text-xs rounded-full transition-colors ${
+                            isExpanding
+                              ? "bg-indigo-100 dark:bg-indigo-900/30 text-indigo-400 cursor-wait"
+                              : isExpanded
+                              ? "bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400"
+                              : "bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 hover:text-indigo-600 dark:hover:text-indigo-400"
+                          }`}
+                          title={isExpanded ? "Cluster expanded" : "Load more words from this cluster"}
+                        >
+                          {isExpanding ? "..." : isExpanded ? `+${expandedClusters[cluster.id].length}` : "+"}
+                        </button>
                       </div>
                     );
                   })}

@@ -3,7 +3,9 @@
 import { useRouter } from "next/navigation";
 import { useCallback } from "react";
 import { SearchInput } from "@/components/SearchInput";
-import { getAvailableWords } from "@/lib/mock-data";
+
+// Example words known to return good results from the backend.
+const EXAMPLE_WORDS = ["happy", "bank", "run", "ocean", "bright", "light"];
 
 export default function Home() {
   const router = useRouter();
@@ -14,8 +16,6 @@ export default function Home() {
     },
     [router]
   );
-
-  const availableWords = getAvailableWords();
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-4 py-16 bg-gradient-to-b from-zinc-50 to-white dark:from-zinc-950 dark:to-zinc-900">
@@ -40,7 +40,7 @@ export default function Home() {
             Try exploring:
           </p>
           <div className="flex flex-wrap gap-2 justify-center">
-            {availableWords.map((word) => (
+            {EXAMPLE_WORDS.map((word) => (
               <button
                 key={word}
                 onClick={() => handleSearch(word)}
