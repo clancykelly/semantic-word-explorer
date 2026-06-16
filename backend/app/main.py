@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .embeddings import DatamuseProvider, get_datamuse_provider, load_word_vectors
+from .llm import LLMEnricher
 from .models import (
     Cluster,
     Coordinates,
@@ -26,12 +27,14 @@ from .models import (
 
 # Single semantic provider (Datamuse), optionally backed by static word vectors.
 provider: DatamuseProvider | None = None
+# Optional LLM enrichment layer (cluster labels). None until lifespan startup.
+enricher: LLMEnricher | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup resources."""
-    global provider
+    global provider, enricher
 
     provider = get_datamuse_provider()
     print("Initialized semantic provider (Datamuse API)")
@@ -44,9 +47,13 @@ async def lifespan(app: FastAPI):
     else:
         print("Word vectors unavailable; clustering will fall back to part-of-speech grouping")
 
+    # Optional LLM enrichment (cluster labels). No-op without ANTHROPIC_API_KEY.
+    enricher = LLMEnricher()
+
     yield
 
     provider = None
+    enricher = None
 
 
 app = FastAPI(
@@ -193,10 +200,17 @@ def explore_word(
         for n in result.neighbors
     ]
 
+    # Optional LLM cluster labels (no-op without ANTHROPIC_API_KEY)
+    cluster_words: dict[int, list[str]] = {}
+    for n in result.neighbors:
+        if n.word != result.normalized_word:
+            cluster_words.setdefault(n.cluster, []).append(n.word)
+    llm_labels = enricher.label_clusters(result.normalized_word, cluster_words) if enricher else None
+
     clusters = [
         Cluster(
             id=c["id"],
-            label=c["label"],
+            label=(llm_labels.get(c["id"]) if llm_labels else None) or c["label"],
             color=c["color"],
             centroid=Coordinates(x=c["centroid"]["x"], y=c["centroid"]["y"]),
         )

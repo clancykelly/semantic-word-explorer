@@ -16,6 +16,7 @@ dependencies = [
 ml = [
     "scikit-learn>=1.4.0",
     "model2vec>=0.3.0",
+    "anthropic>=0.69.0",
 ]
 dev = [
     "pytest>=7.4.0",
