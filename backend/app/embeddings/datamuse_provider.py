@@ -28,6 +28,13 @@ except ImportError:
     AgglomerativeClustering = None
     silhouette_score = None
 
+# Wall-clock caps (seconds) for the parallel Datamuse fetch, so a slow endpoint
+# can't stall a query. ml carries the bulk of candidates and gets the full
+# budget; rel_syn is high-quality but frequently slow, so it's best-effort with
+# a short cap. (The per-read httpx timeout does not bound a slow-trickling body.)
+_DATAMUSE_DEADLINE = 8.0
+_REL_SYN_DEADLINE = 2.0
+
 # Cluster color palette - supports up to 12 clusters
 CLUSTER_COLORS = [
     "#6366f1",  # indigo
@@ -1268,20 +1275,32 @@ class DatamuseProvider(EmbeddingProvider):
         # Datamuse can return up to 1000 results - fetch more for better clustering
         fetch_limit = max(limit * 4, 500)
 
-        # Fetch explicit synonyms (rel_syn) and "means like" (ml) concurrently.
-        # rel_syn is occasionally very slow on Datamuse's side; running it next to
-        # ml keeps it off the critical path (each has its own short timeout).
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            f_syn = pool.submit(
-                self._fetch_from_api,
-                {"rel_syn": normalized, "max": str(min(fetch_limit, 300)), "md": "fp"},
-            )
-            f_ml = pool.submit(
-                self._fetch_from_api,
-                {"ml": normalized, "max": str(min(fetch_limit, 1000)), "md": "fp"},
-            )
-            synonyms = f_syn.result()
-            ml_results = f_ml.result()
+        # Fetch explicit synonyms (rel_syn) and "means like" (ml) concurrently,
+        # under a shared wall-clock cap. rel_syn is occasionally very slow on
+        # Datamuse's side; the deadline keeps one slow endpoint from stalling the
+        # whole request. ml is awaited first since it carries the most results.
+        pool = ThreadPoolExecutor(max_workers=2)
+        f_syn = pool.submit(
+            self._fetch_from_api,
+            {"rel_syn": normalized, "max": str(min(fetch_limit, 300)), "md": "fp"},
+        )
+        f_ml = pool.submit(
+            self._fetch_from_api,
+            {"ml": normalized, "max": str(min(fetch_limit, 1000)), "md": "fp"},
+        )
+        def _await(future, label, budget):
+            try:
+                return future.result(timeout=max(0.0, budget))
+            except Exception as e:  # noqa: BLE001 - timeout/error -> no candidates from this source
+                print(f"Datamuse {label} fetch skipped ({type(e).__name__})")
+                return []
+
+        start = time.monotonic()
+        # ml carries most candidates -> full budget; rel_syn best-effort, short cap.
+        ml_results = _await(f_ml, "ml", _DATAMUSE_DEADLINE)
+        remaining = _DATAMUSE_DEADLINE - (time.monotonic() - start)
+        synonyms = _await(f_syn, "rel_syn", min(_REL_SYN_DEADLINE, remaining))
+        pool.shutdown(wait=False)
 
         # Mark all synonym results with "syn" tag
         synonym_words = set()

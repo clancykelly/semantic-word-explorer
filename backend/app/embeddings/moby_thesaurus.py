@@ -8,6 +8,7 @@ Data source: Project Gutenberg
 https://www.gutenberg.org/files/3202/files/mthesaur.txt
 """
 
+import threading
 from pathlib import Path
 
 
@@ -29,44 +30,53 @@ class MobyThesaurus:
         self._entries: dict[str, list[str]] = {}
         self._reverse_index: dict[str, set[str]] = {}  # word -> headwords containing it
         self._loaded = False
+        self._lock = threading.Lock()
         self._data_path = data_path
 
     def _load(self) -> None:
-        """Load the thesaurus data lazily."""
+        """Load the thesaurus data lazily (thread-safe, idempotent)."""
         if self._loaded:
             return
 
-        if not self._data_path.exists():
-            print(f"Moby Thesaurus not found at {self._data_path}")
+        with self._lock:
+            if self._loaded:
+                return
+
+            if not self._data_path.exists():
+                print(f"Moby Thesaurus not found at {self._data_path}")
+                self._loaded = True
+                return
+
+            print(f"Loading Moby Thesaurus from {self._data_path}...")
+
+            with open(self._data_path, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    parts = line.split(",")
+                    if len(parts) < 2:
+                        continue
+
+                    headword = parts[0].lower().strip()
+                    synonyms = [p.strip() for p in parts[1:] if p.strip()]
+
+                    self._entries[headword] = synonyms
+
+                    # Build reverse index for bidirectional lookup
+                    for syn in synonyms:
+                        syn_lower = syn.lower()
+                        if syn_lower not in self._reverse_index:
+                            self._reverse_index[syn_lower] = set()
+                        self._reverse_index[syn_lower].add(headword)
+
+            print(f"Loaded {len(self._entries)} Moby Thesaurus entries")
             self._loaded = True
-            return
 
-        print(f"Loading Moby Thesaurus from {self._data_path}...")
-
-        with open(self._data_path, encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-
-                parts = line.split(",")
-                if len(parts) < 2:
-                    continue
-
-                headword = parts[0].lower().strip()
-                synonyms = [p.strip() for p in parts[1:] if p.strip()]
-
-                self._entries[headword] = synonyms
-
-                # Build reverse index for bidirectional lookup
-                for syn in synonyms:
-                    syn_lower = syn.lower()
-                    if syn_lower not in self._reverse_index:
-                        self._reverse_index[syn_lower] = set()
-                    self._reverse_index[syn_lower].add(headword)
-
-        print(f"Loaded {len(self._entries)} Moby Thesaurus entries")
-        self._loaded = True
+    def ensure_loaded(self) -> None:
+        """Public hook to trigger the (lazy) load — used for startup preload."""
+        self._load()
 
     def get_synonyms(self, word: str, include_reverse: bool = True) -> list[str]:
         """Get synonyms for a word.

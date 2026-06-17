@@ -2,6 +2,7 @@
 
 import os
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -11,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .embeddings import DatamuseProvider, get_datamuse_provider, load_word_vectors
+from .embeddings.moby_thesaurus import get_moby_thesaurus
 from .llm import LLMEnricher
 from .models import (
     Cluster,
@@ -49,6 +51,10 @@ async def lifespan(app: FastAPI):
 
     # Optional LLM enrichment (cluster labels). No-op without ANTHROPIC_API_KEY.
     enricher = LLMEnricher()
+
+    # Preload the Moby thesaurus in the background so the first query isn't
+    # penalized by its lazy ~2.5M-synonym load.
+    threading.Thread(target=get_moby_thesaurus().ensure_loaded, daemon=True).start()
 
     yield
 
