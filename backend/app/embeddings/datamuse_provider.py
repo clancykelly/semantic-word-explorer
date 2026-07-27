@@ -7,6 +7,7 @@ providing true semantic similarity rather than distributional similarity.
 import hashlib
 import math
 import random
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -34,6 +35,20 @@ except ImportError:
 # a short cap. (The per-read httpx timeout does not bound a slow-trickling body.)
 _DATAMUSE_DEADLINE = 8.0
 _REL_SYN_DEADLINE = 2.0
+
+# Stopwords + grammatical markers excluded from definition-derived seed words
+_SENSE_STOP = frozenset(
+    "a an the of or and to in on for with by at from as is are was were be been being "
+    "that which who whom whose this these those it its one ones something someone etc "
+    "countable uncountable transitive intransitive figuratively figurative literally "
+    "usually especially chiefly obsolete archaic dated slang informal formal vulgar "
+    "such can may often also more most very any all some other others not into upon "
+    "having has have had does do did without within between against "
+    "they them their theirs there then than because even only just what when where "
+    "why how while though although however still yet ever never always sometimes "
+    "once twice again too both each every either neither much many about after "
+    "before during since until place take care make made put get way".split()
+)
 
 # Cluster color palette - supports up to 12 clusters
 CLUSTER_COLORS = [
@@ -147,11 +162,150 @@ class DatamuseProvider(EmbeddingProvider):
         self.use_conceptnet = use_conceptnet
         self._conceptnet_cache: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
         self._conceptnet_cache_ttl: float = 3600.0  # 1 hour
+        # Sense inventory cache: word -> list of sense dicts (see get_senses)
+        self._sense_cache: dict[str, list[dict[str, Any]]] = {}
 
     def set_vectors(self, vectors: WordVectors) -> None:
         """Set the static word-vector model for relevance scoring + clustering."""
         self._vectors = vectors
         print(f"DatamuseProvider: semantic vectors enabled ({vectors.model_name}, dim {vectors.dim})")
+
+    def get_senses(self, word: str) -> list[dict[str, Any]]:
+        """Sense inventory for a word, derived from Datamuse dictionary defs.
+
+        Fetches Wiktionary-style definitions (``md=d``), extracts seed words
+        from each gloss, merges near-duplicate senses by seed-centroid cosine
+        (e.g. "bank" has many financial glosses that collapse to one sense),
+        and caps the inventory at 4. Cached per word.
+
+        Returns dicts: {"id": "word|N", "pos", "label", "seeds"}.
+        """
+        key = word.lower().strip()
+        if key in self._sense_cache:
+            return self._sense_cache[key]
+
+        results = self._fetch_from_api({"sp": key, "md": "d", "max": "1"})
+        defs: list[str] = []
+        for r in results:
+            if r.get("word", "").lower() == key:
+                defs = r.get("defs") or []
+                break
+
+        # Proper-noun definitions (toponyms, personal names) aren't thesaurus
+        # senses — Wiktionary lists them for many common words.
+        proper_noun_def = re.compile(
+            r"surname|given name|census|township|borough|"
+            r"a (city|town|village|county|community|municipality|district|parish) in",
+            re.IGNORECASE,
+        )
+
+        candidates: list[dict[str, Any]] = []
+        for d in defs[:40]:
+            pos, _, gloss = d.partition("\t")
+            gloss = gloss.strip()
+            if not gloss or proper_noun_def.search(gloss):
+                continue
+            tokens = [
+                t.strip(".,;:'\"")
+                for t in gloss.lower().replace("(", " ").replace(")", " ").split()
+            ]
+            seeds = [
+                t for t in tokens
+                if t.isalpha() and len(t) > 2 and t not in _SENSE_STOP and t != key
+            ]
+            seeds = list(dict.fromkeys(seeds))[:6]
+            if len(seeds) < 2:
+                continue
+            # Short human label: first clause, leading "(context)" marker stripped
+            label = re.sub(r"^\([^)]*\)\s*", "", gloss)
+            label = label.split(";")[0].split(",")[0].strip().rstrip(".").lower()
+            if len(label) > 42:
+                label = label[:40].rsplit(" ", 1)[0] + "…"
+            if not label:
+                continue
+            candidates.append({"pos": pos, "label": label, "seeds": seeds})
+
+        # Pick a diverse sense inventory via farthest-point selection: start
+        # from the dominant sense (Datamuse orders defs by prominence), then
+        # repeatedly add the def MOST dissimilar to everything kept. This is
+        # what surfaces "bank (river)" instead of four financial variants.
+        senses: list[dict[str, Any]] = []
+        if self._vectors is not None and candidates:
+            valid: list[tuple[dict[str, Any], np.ndarray]] = []
+            for s in candidates:
+                c = self._vectors.encode(s["seeds"]).mean(axis=0)
+                norm = float(np.linalg.norm(c))
+                if norm > 0:
+                    valid.append((s, c / norm))
+
+            if valid:
+                kept: list[tuple[dict[str, Any], np.ndarray]] = [valid[0]]
+                while len(kept) < 4:
+                    best: tuple[dict[str, Any], np.ndarray] | None = None
+                    best_maxsim = 1.0
+                    for s, c in valid:
+                        if any(s is ks for ks, _ in kept):
+                            continue
+                        maxsim = max(float(c @ kc) for _, kc in kept)
+                        if maxsim < best_maxsim:
+                            best_maxsim = maxsim
+                            best = (s, c)
+                    # Stop when the most-distinct remaining def is still a
+                    # near-duplicate of a kept sense.
+                    if best is None or best_maxsim >= 0.72:
+                        break
+                    kept.append(best)
+                senses = [s for s, _ in kept]
+        else:
+            senses = candidates[:3]
+
+        for i, s in enumerate(senses):
+            s["id"] = f"{key}|{i}"
+
+        self._sense_cache[key] = senses
+        return senses
+
+    def _query_vector(self, query_word: str, seeds: list[str] | None = None) -> np.ndarray | None:
+        """Vector the query is scored against — optionally a sense-aware centroid.
+
+        With seeds (gloss words of a selected sense), the vector is an equal
+        blend of the query word and the seed centroid, pulling relevance toward
+        that sense's neighborhood.
+        """
+        if self._vectors is None:
+            return None
+        qv = self._vectors.encode([query_word.lower()])[0]
+        if not seeds:
+            return qv
+        # Weight the seeds heavily: the query word's static vector encodes its
+        # DOMINANT sense (e.g. "bank" ~ finance), which would drown out a
+        # minority sense like the river bank if blended equally.
+        sv = self._vectors.encode([s.lower() for s in seeds]).mean(axis=0)
+        centroid = 0.25 * qv + 0.75 * sv
+        norm = float(np.linalg.norm(centroid))
+        return centroid / norm if norm > 0 else qv
+
+    def _sims_to_query(
+        self, query_word: str, words: list[str], seeds: list[str] | None
+    ) -> np.ndarray | None:
+        """Cosine of each word to the query vector (sense centroid when seeded).
+
+        Under a sense, the query token is stripped from phrases before encoding
+        ("central bank" scores as "central"), so phrases containing the query
+        word can't free-ride on its vector and swamp the minority sense.
+        """
+        qvec = self._query_vector(query_word, seeds)
+        if qvec is None:
+            return None
+        qtok = query_word.lower()
+        enc: list[str] = []
+        for w in words:
+            wl = w.lower()
+            if seeds and " " in wl:
+                parts = [p for p in wl.split() if p != qtok]
+                wl = " ".join(parts) if parts else wl
+            enc.append(wl)
+        return self._vectors.encode(enc) @ qvec
 
     def _fetch_from_api(self, params: dict[str, str]) -> list[dict[str, Any]]:
         """Fetch results from Datamuse API."""
@@ -884,6 +1038,7 @@ class DatamuseProvider(EmbeddingProvider):
         self,
         query_word: str,
         candidates: list[dict[str, Any]],
+        seeds: list[str] | None = None,
     ) -> list[tuple[dict[str, Any], float]]:
         """Compute cosine similarity between each candidate and the query word.
 
@@ -895,12 +1050,11 @@ class DatamuseProvider(EmbeddingProvider):
             List of (word_data, similarity) tuples, sorted by similarity descending.
             Words without embeddings get similarity of 0.0.
         """
-        if self._vectors is None:
+        words = [c.get("word", "").lower() for c in candidates]
+        sims = self._sims_to_query(query_word, words, seeds)
+        if sims is None:
             # No vectors - return all with similarity 1.0 (no filtering)
             return [(c, 1.0) for c in candidates]
-
-        words = [c.get("word", "").lower() for c in candidates]
-        sims = self._vectors.similarities(query_word.lower(), words)
 
         scored = []
         for candidate, sim in zip(candidates, sims):
@@ -963,6 +1117,7 @@ class DatamuseProvider(EmbeddingProvider):
         query_word: str,
         candidates: list[dict[str, Any]],
         threshold: float | None = None,
+        seeds: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Filter candidates by relevance to query word.
 
@@ -974,8 +1129,8 @@ class DatamuseProvider(EmbeddingProvider):
         Returns:
             Filtered list of candidates with sufficient relevance
         """
-        # Compute relevance scores
-        scored = self._compute_query_relevance(query_word, candidates)
+        # Compute relevance scores (sense-aware when seeds are provided)
+        scored = self._compute_query_relevance(query_word, candidates, seeds=seeds)
 
         if not scored:
             return []
@@ -1012,6 +1167,11 @@ class DatamuseProvider(EmbeddingProvider):
             word = candidate.get("word", "")
             is_phrase = " " in word
 
+            # Under a sense, bare function words ride the centroid's hub
+            # region and sneak through — they're never useful output.
+            if seeds is not None and not is_synonym and word.lower() in _SENSE_STOP:
+                continue
+
             has_embedding = candidate.get("_has_embedding", True)
 
             # Words not in GloVe vocabulary (archaic/rare) need special handling
@@ -1028,10 +1188,18 @@ class DatamuseProvider(EmbeddingProvider):
                 else:
                     continue
 
-            # Datamuse synonyms with embeddings are always kept (high-quality)
+            # Datamuse synonyms are high-quality but sense-agnostic: keep them
+            # unconditionally only when no sense is selected. Under a sense,
+            # they must clear the (lenient) curated bar vs. the sense centroid —
+            # e.g. financial synonyms of "bank" drop out of the river sense.
             if is_synonym:
-                candidate["_relevance"] = sim
-                filtered.append(candidate)
+                if seeds is None:
+                    candidate["_relevance"] = sim
+                    filtered.append(candidate)
+                    continue
+                if sim >= max(threshold - 0.05, 0.15):
+                    candidate["_relevance"] = sim
+                    filtered.append(candidate)
                 continue
 
             # Determine the effective threshold for this candidate
@@ -1254,7 +1422,8 @@ class DatamuseProvider(EmbeddingProvider):
 
         Args:
             word: The word to search for
-            sense: Optional specific sense (not used currently)
+            sense: Optional sense id from the inventory (e.g. "bank|1"); when
+                   set, retrieval and scoring are steered toward that sense
             limit: Maximum results to return
             layout: Visualization layout
             include_rare: Whether to include rare words
@@ -1279,7 +1448,15 @@ class DatamuseProvider(EmbeddingProvider):
         # under a shared wall-clock cap. rel_syn is occasionally very slow on
         # Datamuse's side; the deadline keeps one slow endpoint from stalling the
         # whole request. ml is awaited first since it carries the most results.
-        pool = ThreadPoolExecutor(max_workers=2)
+        # Resolve the requested sense. The inventory is cached from the first
+        # (sense-less) query for this word — the one that populated the picker.
+        sense_info: dict[str, Any] | None = None
+        if sense:
+            inventory = self.get_senses(normalized)
+            sense_info = next((s for s in inventory if s["id"] == sense), None)
+        seeds = sense_info["seeds"] if sense_info else None
+
+        pool = ThreadPoolExecutor(max_workers=5)
         f_syn = pool.submit(
             self._fetch_from_api,
             {"rel_syn": normalized, "max": str(min(fetch_limit, 300)), "md": "fp"},
@@ -1288,6 +1465,18 @@ class DatamuseProvider(EmbeddingProvider):
             self._fetch_from_api,
             {"ml": normalized, "max": str(min(fetch_limit, 1000)), "md": "fp"},
         )
+        # Sense inventory for the picker (prefetch unless already cached)
+        f_senses = None
+        if normalized not in self._sense_cache:
+            f_senses = pool.submit(self.get_senses, normalized)
+        # Under a selected sense, pull extra candidates via ml on its top seed
+        # words, so words absent from the plain query results can surface
+        # (e.g. shore/levee for the river sense of "bank").
+        f_seed_ml = [
+            pool.submit(self._fetch_from_api, {"ml": s, "max": "150", "md": "fp"})
+            for s in (seeds[:2] if seeds else [])
+        ]
+
         def _await(future, label, budget):
             try:
                 return future.result(timeout=max(0.0, budget))
@@ -1300,6 +1489,13 @@ class DatamuseProvider(EmbeddingProvider):
         ml_results = _await(f_ml, "ml", _DATAMUSE_DEADLINE)
         remaining = _DATAMUSE_DEADLINE - (time.monotonic() - start)
         synonyms = _await(f_syn, "rel_syn", min(_REL_SYN_DEADLINE, remaining))
+        seed_results: list[dict[str, Any]] = []
+        for i, f in enumerate(f_seed_ml):
+            remaining = _DATAMUSE_DEADLINE - (time.monotonic() - start)
+            seed_results.extend(_await(f, f"seed-ml[{i}]", max(remaining, 1.0)))
+        if f_senses is not None:
+            remaining = _DATAMUSE_DEADLINE - (time.monotonic() - start)
+            _await(f_senses, "senses", max(remaining, 1.0))  # populates the cache
         pool.shutdown(wait=False)
 
         # Mark all synonym results with "syn" tag
@@ -1318,6 +1514,20 @@ class DatamuseProvider(EmbeddingProvider):
             word_text = ml_word.get("word", "")
             if word_text not in seen_words:
                 results.append(ml_word)
+                seen_words.add(word_text)
+
+        # Sense-seed candidates (relevance filtering vs. the sense centroid
+        # decides what actually survives). Skip function-word junk — GloVe-style
+        # vectors make stopwords spuriously similar to everything.
+        for seed_word in seed_results:
+            word_text = seed_word.get("word", "")
+            if (
+                word_text
+                and word_text not in seen_words
+                and word_text.lower() != normalized
+                and word_text.lower() not in _SENSE_STOP
+            ):
+                results.append(seed_word)
                 seen_words.add(word_text)
 
         # Add results from Moby Thesaurus (good for literary/poetic phrases)
@@ -1384,7 +1594,7 @@ class DatamuseProvider(EmbeddingProvider):
 
         # Filter by relevance to query word (removes loosely related words)
         # This is the key step that filters out "asia", "japan" for "ocean"
-        results = self._filter_by_relevance(normalized, results, threshold=relevance)
+        results = self._filter_by_relevance(normalized, results, threshold=relevance, seeds=seeds)
 
         if not results:
             return None
@@ -1482,11 +1692,20 @@ class DatamuseProvider(EmbeddingProvider):
                 "centroid": {"x": centroid_x, "y": centroid_y},
             })
 
+        # Real sense inventory (from dictionary definitions); only offer a picker
+        # when the word actually has 2+ distinct senses.
+        inventory = self._sense_cache.get(normalized, [])
+        available_senses = (
+            [SenseInfo(s["id"], s["label"], 100 - 10 * i) for i, s in enumerate(inventory)]
+            if len(inventory) >= 2
+            else []
+        )
+
         return SearchResult(
             word=word,
             normalized_word=normalized,
-            sense=None,
-            available_senses=[SenseInfo(f"{normalized}|SEMANTIC", f"{normalized} (semantic)", 100)],
+            sense=sense_info["id"] if sense_info else None,
+            available_senses=available_senses,
             neighbors=neighbors,
             clusters=clusters,
         )
@@ -1559,11 +1778,10 @@ class DatamuseProvider(EmbeddingProvider):
         cluster_assignments, custom_labels = self._assign_clusters(results, query_word=normalized)
         coordinates = self._compute_coordinates(results, cluster_assignments, normalized, "force")
 
-        # Similarity = cosine to the query word (consistent with the main view)
+        # Similarity = cosine to the query (or the sense centroid, when active)
         result_words = [r.get("word", "") for r in results]
-        if self._vectors is not None:
-            sims = self._vectors.similarities(normalized, [w.lower() for w in result_words])
-        else:
+        sims = self._sims_to_query(normalized, [w.lower() for w in result_words], seeds)
+        if sims is None:
             sims = [0.5] * len(results)
 
         neighbors = []

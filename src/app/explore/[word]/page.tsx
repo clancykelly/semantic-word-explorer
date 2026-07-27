@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, use } from "react";
+import { useEffect, useState, useCallback, useRef, use } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { SearchInput } from "@/components/SearchInput";
@@ -26,58 +26,54 @@ export default function ExplorePage({ params }: ExplorePageProps) {
     data: null,
     error: null,
   });
-  const [selectedSense, setSelectedSense] = useState<string | null>(null);
+  // "" = all senses; otherwise a sense id from the inventory (e.g. "bank|1").
+  // Picking a sense re-queries the backend with sense-steered retrieval.
+  const [selectedSense, setSelectedSense] = useState<string>("");
   const [includeRare, setIncludeRare] = useState<boolean>(false);
   const [viewMode, setViewMode] = useState<ViewMode>("graph");
   const [expandedClusters, setExpandedClusters] = useState<Record<number, WordNeighbor[]>>({});
   const [expandingCluster, setExpandingCluster] = useState<number | null>(null);
+  // Guards against a slow earlier response clobbering a newer one
+  const requestIdRef = useRef(0);
 
   // Fetch word data
   const fetchWord = useCallback(
     async (searchWord: string, sense: string | undefined, searchIncludeRare: boolean) => {
+      const requestId = ++requestIdRef.current;
       setState((prev) => ({ ...prev, status: "loading", error: null }));
 
       const result = await exploreWord(searchWord, sense, searchIncludeRare);
+      if (requestId !== requestIdRef.current) return; // stale response
 
       if (result.success) {
-        setState({
-          status: "success",
-          data: result.data,
-          error: null,
-        });
-        // Set initial sense if not already set
-        if (!sense && result.data.query.sense) {
-          setSelectedSense(result.data.query.sense);
-        }
+        setState({ status: "success", data: result.data, error: null });
       } else {
-        setState({
-          status: "error",
-          data: null,
-          error: result.error,
-        });
+        setState({ status: "error", data: null, error: result.error });
       }
     },
     []
   );
 
-  // Initial load and includeRare change
+  // Single fetch effect: word, sense, and rare-words toggle all funnel here.
   useEffect(() => {
     void fetchWord(decodedWord, selectedSense || undefined, includeRare);
-  }, [decodedWord, includeRare, fetchWord, selectedSense]);
+  }, [decodedWord, selectedSense, includeRare, fetchWord]);
 
-  // Handle sense change
-  const handleSenseChange = useCallback(
-    (sense: string) => {
-      setSelectedSense(sense);
-      fetchWord(decodedWord, sense, includeRare);
-    },
-    [decodedWord, fetchWord, includeRare]
-  );
+  // Reset transient view state when the word changes
+  useEffect(() => {
+    setExpandedClusters({});
+    setSelectedSense("");
+  }, [decodedWord]);
+
+  // Sense selection triggers a sense-steered re-query via the fetch effect.
+  const handleSenseChange = useCallback((sense: string) => {
+    setSelectedSense(sense);
+  }, []);
 
   // Handle new search
   const handleSearch = useCallback(
     (newWord: string) => {
-      setSelectedSense(null);
+      setSelectedSense("");
       router.push(`/explore/${encodeURIComponent(newWord)}`);
     },
     [router]
@@ -86,7 +82,7 @@ export default function ExplorePage({ params }: ExplorePageProps) {
   // Handle clicking a word in the visualization
   const handleWordClick = useCallback(
     (clickedWord: string) => {
-      setSelectedSense(null);
+      setSelectedSense("");
       router.push(`/explore/${encodeURIComponent(clickedWord)}`);
     },
     [router]
@@ -98,12 +94,9 @@ export default function ExplorePage({ params }: ExplorePageProps) {
   }, [decodedWord, selectedSense, fetchWord, includeRare]);
 
   // Handle include rare toggle
-  const handleIncludeRareChange = useCallback(
-    (newIncludeRare: boolean) => {
-      setIncludeRare(newIncludeRare);
-    },
-    []
-  );
+  const handleIncludeRareChange = useCallback((newIncludeRare: boolean) => {
+    setIncludeRare(newIncludeRare);
+  }, []);
 
   // Handle cluster expansion
   const handleExpandCluster = useCallback(
@@ -128,29 +121,17 @@ export default function ExplorePage({ params }: ExplorePageProps) {
 
       setExpandingCluster(clusterId);
 
-      const result = await expandCluster(
-        decodedWord,
-        clusterWords,
-        excludeWords,
-        30
-      );
+      const result = await expandCluster(decodedWord, clusterWords, excludeWords, 30);
 
       setExpandingCluster(null);
 
       if (result.success && result.data.neighbors.length > 0) {
-        setExpandedClusters((prev) => ({
-          ...prev,
-          [clusterId]: result.data.neighbors,
-        }));
+        setExpandedClusters((prev) => ({ ...prev, [clusterId]: result.data.neighbors }));
       }
     },
     [state.data, decodedWord, expandingCluster]
   );
 
-  // Reset expanded clusters when word changes
-  useEffect(() => {
-    setExpandedClusters({});
-  }, [decodedWord]);
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-zinc-50 to-white dark:from-zinc-950 dark:to-zinc-900">
@@ -323,7 +304,7 @@ export default function ExplorePage({ params }: ExplorePageProps) {
 
               <SensePicker
                 senses={state.data.query.availableSenses}
-                selectedSense={selectedSense || state.data.query.sense || ""}
+                selectedSense={selectedSense}
                 onSelectSense={handleSenseChange}
               />
 
