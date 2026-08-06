@@ -1646,8 +1646,10 @@ class DatamuseProvider(EmbeddingProvider):
             # This is more meaningful than Datamuse score (which is 0 for synonyms)
             relevance = result.get("_relevance", 0.5)
 
-            # Cap at 1.0 and ensure reasonable display range
-            similarity = min(1.0, relevance)
+            # Clamp to [0, 1]: always-kept synonyms bypass the relevance
+            # threshold and can carry a slightly negative cosine, which the
+            # API schema (ge=0) rejects.
+            similarity = max(0.0, min(1.0, relevance))
 
             neighbors.append(
                 WordResult(

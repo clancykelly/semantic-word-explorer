@@ -41,8 +41,9 @@ export async function GET(request: NextRequest) {
     // Transform and return success response
     const result = transformResponse(data as PythonExploreResponse);
     return NextResponse.json(result);
-  } catch {
+  } catch (err) {
     // Backend unavailable - return error
+    console.error("explore route error:", err);
     const errorResponse: ErrorResponse = {
       error: "Backend service unavailable. Please try again later.",
       type: "server_error",
