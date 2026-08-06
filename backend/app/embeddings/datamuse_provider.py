@@ -1128,7 +1128,7 @@ class DatamuseProvider(EmbeddingProvider):
         threshold: float | None = None,
         seeds: list[str] | None = None,
         functional_query: bool = False,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Filter candidates by relevance to query word.
 
         Args:
@@ -1137,13 +1137,16 @@ class DatamuseProvider(EmbeddingProvider):
             threshold: Similarity threshold (None = adaptive)
 
         Returns:
-            Filtered list of candidates with sufficient relevance
+            (kept, colloc): candidates with sufficient semantic relevance, and a
+            small pool of related-but-not-similar words (Datamuse-ranked ml
+            candidates that failed the semantic bar) for the "often
+            co-occurring" pile.
         """
         # Compute relevance scores (sense-aware when seeds are provided)
         scored = self._compute_query_relevance(query_word, candidates, seeds=seeds)
 
         if not scored:
-            return []
+            return [], []
 
         # Extract similarities for threshold calculation
         similarities = [sim for _, sim in scored]
@@ -1235,8 +1238,31 @@ class DatamuseProvider(EmbeddingProvider):
                 candidate["_relevance"] = sim
                 filtered.append(candidate)
 
-        print(f"Relevance filter: {len(candidates)} → {len(filtered)} candidates (threshold={threshold:.3f})")
-        return filtered
+        # Related-but-not-similar pool: ml-only single words that failed the
+        # semantic bar, ranked by Datamuse's own relatedness score (our vector
+        # cosine is ~0 for these by design — e.g. ocean~vast on Model2Vec).
+        kept_ids = {id(c) for c in filtered}
+        colloc: list[dict[str, Any]] = []
+        for candidate, sim in scored:
+            if id(candidate) in kept_ids:
+                continue
+            word = candidate.get("word", "")
+            tags = candidate.get("tags", [])
+            if (
+                " " not in word
+                and len(word) > 2
+                and word.lower() not in _SENSE_STOP
+                and "syn" not in tags
+                and "moby" not in tags
+                and candidate.get("score", 0) > 0
+            ):
+                candidate["_relevance"] = max(0.0, sim)
+                colloc.append(candidate)
+        colloc.sort(key=lambda c: -c.get("score", 0))
+        colloc = colloc[:12]
+
+        print(f"Relevance filter: {len(candidates)} → {len(filtered)} candidates (threshold={threshold:.3f}, colloc pool={len(colloc)})")
+        return filtered, colloc
 
     def _filter_by_frequency(
         self,
@@ -1622,9 +1648,12 @@ class DatamuseProvider(EmbeddingProvider):
             s.get("pos", "").lower() in _FUNCTION_POS for s in inventory
         )
 
-        results = self._filter_by_relevance(
+        results, colloc = self._filter_by_relevance(
             normalized, results, threshold=relevance, seeds=seeds, functional_query=functional_query
         )
+        # The co-occurring pile is an all-senses feature; sense views stay clean.
+        if seeds is not None:
+            colloc = []
 
         if not results:
             return None
@@ -1643,6 +1672,16 @@ class DatamuseProvider(EmbeddingProvider):
 
         if not results:
             return None
+
+        # Append the related/co-occurring pile as its own dedicated cluster —
+        # words Datamuse links to the query that aren't semantic substitutes
+        # (e.g. beneath -> glistening, ocean -> vast). Requires the clustered
+        # path; skipped in the POS-fallback mode.
+        if colloc and precomputed_assignments is not None:
+            pile_id = max(precomputed_assignments) + 1 if precomputed_assignments else 0
+            results = results + colloc
+            precomputed_assignments = precomputed_assignments + [pile_id] * len(colloc)
+            precomputed_labels = (precomputed_labels or []) + ["related · often co-occurring"]
 
         # Compute visualization data (reuse cluster info from sampling if available)
         cluster_assignments, custom_cluster_labels = self._assign_clusters(
