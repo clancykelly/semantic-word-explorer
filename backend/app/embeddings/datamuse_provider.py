@@ -36,6 +36,15 @@ except ImportError:
 _DATAMUSE_DEADLINE = 8.0
 _REL_SYN_DEADLINE = 2.0
 
+# Definition POS values marking a purely functional (closed-class-ish) query
+# word — prepositions, pronouns, pure adverbs like "beneath". For these, the
+# distributional neighborhood is collocates ("glistening beneath...") rather
+# than substitutes, so content-word candidates need a much higher bar.
+_FUNCTION_POS = frozenset(
+    "adv adverb prep preposition conj conjunction pron pronoun det determiner "
+    "article interj interjection particle postp phrase".split()
+)
+
 # Stopwords + grammatical markers excluded from definition-derived seed words
 _SENSE_STOP = frozenset(
     "a an the of or and to in on for with by at from as is are was were be been being "
@@ -1118,6 +1127,7 @@ class DatamuseProvider(EmbeddingProvider):
         candidates: list[dict[str, Any]],
         threshold: float | None = None,
         seeds: list[str] | None = None,
+        functional_query: bool = False,
     ) -> list[dict[str, Any]]:
         """Filter candidates by relevance to query word.
 
@@ -1171,6 +1181,16 @@ class DatamuseProvider(EmbeddingProvider):
             # region and sneak through — they're never useful output.
             if seeds is not None and not is_synonym and word.lower() in _SENSE_STOP:
                 continue
+
+            # Function-word query (e.g. "beneath"): its vector neighborhood is
+            # poetic collocates, not synonyms — cosine(beneath, glistening) even
+            # beats cosine(beneath, under) in GloVe. Pure content-word
+            # candidates (no adverbial reading) must clear a high bar; words
+            # with an adv tag ("under", "underneath") pass normally.
+            if functional_query and not is_synonym:
+                pos_tags = {t for t in tags if t in ("n", "v", "adj", "adv")}
+                if pos_tags and "adv" not in pos_tags and sim < 0.55:
+                    continue
 
             has_embedding = candidate.get("_has_embedding", True)
 
@@ -1594,7 +1614,17 @@ class DatamuseProvider(EmbeddingProvider):
 
         # Filter by relevance to query word (removes loosely related words)
         # This is the key step that filters out "asia", "japan" for "ocean"
-        results = self._filter_by_relevance(normalized, results, threshold=relevance, seeds=seeds)
+        # A query whose every dictionary sense is functional POS (adv/prep/...)
+        # gets collocate-resistant filtering; inventory may be empty if the
+        # definition fetch failed, in which case filtering stays permissive.
+        inventory = self._sense_cache.get(normalized, [])
+        functional_query = bool(inventory) and all(
+            s.get("pos", "").lower() in _FUNCTION_POS for s in inventory
+        )
+
+        results = self._filter_by_relevance(
+            normalized, results, threshold=relevance, seeds=seeds, functional_query=functional_query
+        )
 
         if not results:
             return None
