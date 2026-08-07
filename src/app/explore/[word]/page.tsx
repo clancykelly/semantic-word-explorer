@@ -257,7 +257,7 @@ export default function ExplorePage({ params }: ExplorePageProps) {
                   {state.data.query.normalizedWord}
                 </h1>
                 <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-[var(--faint)]">
-                  {state.data.meta.totalResults} words · {state.data.meta.queryTimeMs} ms
+                  {state.data.meta.totalResults} words
                 </p>
               </div>
               <SensePicker

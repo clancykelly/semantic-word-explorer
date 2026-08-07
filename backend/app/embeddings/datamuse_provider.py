@@ -56,7 +56,8 @@ _SENSE_STOP = frozenset(
     "they them their theirs there then than because even only just what when where "
     "why how while though although however still yet ever never always sometimes "
     "once twice again too both each every either neither much many about after "
-    "before during since until place take care make made put get way".split()
+    "before during since until place take care make made put get way "
+    "typically normally usually generally commonly primarily mainly mostly".split()
 )
 
 # Cluster color palette - supports up to 12 clusters
@@ -203,8 +204,10 @@ class DatamuseProvider(EmbeddingProvider):
         # Proper-noun definitions (toponyms, personal names) aren't thesaurus
         # senses — Wiktionary lists them for many common words.
         proper_noun_def = re.compile(
-            r"surname|given name|census|township|borough|"
-            r"a (city|town|village|county|community|municipality|district|parish) in",
+            r"surname|given name|census|township|borough|unincorporated|"
+            r"settlement|hamlet|suburb|placename|"
+            r"(city|town|village|county|community|municipality|district|parish|"
+            r"neighbou?rhood|region|commune|province) (in|of)\b",
             re.IGNORECASE,
         )
 
@@ -228,8 +231,8 @@ class DatamuseProvider(EmbeddingProvider):
             # Short human label: first clause, leading "(context)" marker stripped
             label = re.sub(r"^\([^)]*\)\s*", "", gloss)
             label = label.split(";")[0].split(",")[0].strip().rstrip(".").lower()
-            if len(label) > 42:
-                label = label[:40].rsplit(" ", 1)[0] + "…"
+            if len(label) > 58:
+                label = label[:56].rsplit(" ", 1)[0] + "…"
             if not label:
                 continue
             candidates.append({"pos": pos, "label": label, "seeds": seeds})
@@ -274,28 +277,36 @@ class DatamuseProvider(EmbeddingProvider):
         self._sense_cache[key] = senses
         return senses
 
-    def _query_vector(self, query_word: str, seeds: list[str] | None = None) -> np.ndarray | None:
+    def _query_vector(
+        self,
+        query_word: str,
+        seeds: list[str] | None = None,
+        query_weight: float = 0.25,
+    ) -> np.ndarray | None:
         """Vector the query is scored against — optionally a sense-aware centroid.
 
-        With seeds (gloss words of a selected sense), the vector is an equal
-        blend of the query word and the seed centroid, pulling relevance toward
-        that sense's neighborhood.
+        With seeds (gloss words of a selected sense), the vector blends the
+        query word and the seed centroid. ``query_weight=0`` gives the pure
+        sense signal — important for FILTERING, because every candidate already
+        relates to the query, so any query component adds a near-uniform boost
+        that erases the differences BETWEEN senses.
         """
         if self._vectors is None:
             return None
         qv = self._vectors.encode([query_word.lower()])[0]
         if not seeds:
             return qv
-        # Weight the seeds heavily: the query word's static vector encodes its
-        # DOMINANT sense (e.g. "bank" ~ finance), which would drown out a
-        # minority sense like the river bank if blended equally.
         sv = self._vectors.encode([s.lower() for s in seeds]).mean(axis=0)
-        centroid = 0.25 * qv + 0.75 * sv
+        centroid = query_weight * qv + (1.0 - query_weight) * sv
         norm = float(np.linalg.norm(centroid))
         return centroid / norm if norm > 0 else qv
 
     def _sims_to_query(
-        self, query_word: str, words: list[str], seeds: list[str] | None
+        self,
+        query_word: str,
+        words: list[str],
+        seeds: list[str] | None,
+        query_weight: float = 0.25,
     ) -> np.ndarray | None:
         """Cosine of each word to the query vector (sense centroid when seeded).
 
@@ -303,7 +314,7 @@ class DatamuseProvider(EmbeddingProvider):
         ("central bank" scores as "central"), so phrases containing the query
         word can't free-ride on its vector and swamp the minority sense.
         """
-        qvec = self._query_vector(query_word, seeds)
+        qvec = self._query_vector(query_word, seeds, query_weight=query_weight)
         if qvec is None:
             return None
         qtok = query_word.lower()
@@ -1080,6 +1091,7 @@ class DatamuseProvider(EmbeddingProvider):
         query_word: str,
         candidates: list[dict[str, Any]],
         seeds: list[str] | None = None,
+        query_weight: float = 0.25,
     ) -> list[tuple[dict[str, Any], float]]:
         """Compute cosine similarity between each candidate and the query word.
 
@@ -1092,7 +1104,7 @@ class DatamuseProvider(EmbeddingProvider):
             Words without embeddings get similarity of 0.0.
         """
         words = [c.get("word", "").lower() for c in candidates]
-        sims = self._sims_to_query(query_word, words, seeds)
+        sims = self._sims_to_query(query_word, words, seeds, query_weight=query_weight)
         if sims is None:
             # No vectors - return all with similarity 1.0 (no filtering)
             return [(c, 1.0) for c in candidates]
@@ -1160,6 +1172,7 @@ class DatamuseProvider(EmbeddingProvider):
         threshold: float | None = None,
         seeds: list[str] | None = None,
         functional_query: bool = False,
+        strict_seed: bool = True,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Filter candidates by relevance to query word.
 
@@ -1174,8 +1187,15 @@ class DatamuseProvider(EmbeddingProvider):
             candidates that failed the semantic bar) for the "often
             co-occurring" pile.
         """
-        # Compute relevance scores (sense-aware when seeds are provided)
-        scored = self._compute_query_relevance(query_word, candidates, seeds=seeds)
+        requested_threshold = threshold
+        # Under a sense, FILTER against the seed-only centroid: every candidate
+        # already relates to the query, so blending the query vector in adds a
+        # near-uniform boost that erases the differences between senses (the
+        # "money senses all look the same" failure).
+        strict = strict_seed and seeds is not None
+        scored = self._compute_query_relevance(
+            query_word, candidates, seeds=seeds, query_weight=0.0 if strict else 0.25
+        )
 
         if not scored:
             return [], []
@@ -1197,6 +1217,10 @@ class DatamuseProvider(EmbeddingProvider):
         # - Uncurated ML results need higher threshold to filter tangential words
         ml_threshold = max(threshold + 0.05, 0.30)  # Stricter for ML-only results
         curated_threshold = max(threshold - 0.05, 0.15)  # Floor for Moby / ConceptNet single words
+        if strict:
+            # No discounts inside a sense: curated sources are sense-agnostic,
+            # so they must clear the same bar as everything else.
+            curated_threshold = threshold
 
         # Phrases need higher similarity threshold since average embeddings are noisier
         phrase_threshold = max(threshold, 0.55)
@@ -1252,7 +1276,8 @@ class DatamuseProvider(EmbeddingProvider):
                     candidate["_relevance"] = sim
                     filtered.append(candidate)
                     continue
-                if sim >= max(threshold - 0.05, 0.15):
+                syn_floor = threshold if strict else max(threshold - 0.05, 0.15)
+                if sim >= syn_floor:
                     candidate["_relevance"] = sim
                     filtered.append(candidate)
                 continue
@@ -1269,6 +1294,19 @@ class DatamuseProvider(EmbeddingProvider):
                 # Store the relevance score for later use
                 candidate["_relevance"] = sim
                 filtered.append(candidate)
+
+        # If strict per-sense filtering left too little, the seeds were probably
+        # weak — relax to the blended centroid rather than show an empty sense.
+        if strict and len(filtered) < 10:
+            print(f"Sense filter too strict ({len(filtered)} kept) — relaxing to blended centroid")
+            return self._filter_by_relevance(
+                query_word,
+                candidates,
+                threshold=requested_threshold,
+                seeds=seeds,
+                functional_query=functional_query,
+                strict_seed=False,
+            )
 
         # Related-but-not-similar pool: ml-only single words that failed the
         # semantic bar, ranked by Datamuse's own relatedness score (our vector

@@ -35,7 +35,7 @@ export function SensePicker({
             onClick={() => onSelectSense(option.sense)}
             title={option.label}
             aria-pressed={active}
-            className={`font-mono text-[11px] lowercase px-2.5 py-1 rounded-[3px] border transition-colors max-w-[240px] truncate ${
+            className={`font-mono text-[11px] lowercase px-2.5 py-1 rounded-[3px] border transition-colors max-w-[320px] truncate ${
               active
                 ? "bg-[var(--ink)] text-[var(--paper)] border-transparent"
                 : "border-[var(--line)] text-[var(--muted)] hover:text-[var(--ink)] hover:border-[var(--muted)]"
