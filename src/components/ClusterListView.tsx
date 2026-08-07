@@ -5,207 +5,168 @@ import type { WordNeighbor, Cluster } from "@/lib/types";
 
 type SortMode = "similarity" | "formality" | "alphabetical";
 
+const PILE_MARKER = "co-occurring";
+
 interface ClusterListViewProps {
   neighbors: WordNeighbor[];
   clusters: Cluster[];
   queryWord: string;
-  onWordClick: (word: string) => void;
+  expandedClusters: Record<number, WordNeighbor[]>;
+  expandingCluster: number | null;
+  onExplore: (word: string) => void;
+  onCopy: (word: string) => void;
+  onExpandCluster: (clusterId: number) => void;
 }
 
 export function ClusterListView({
   neighbors,
   clusters,
   queryWord,
-  onWordClick,
+  expandedClusters,
+  expandingCluster,
+  onExplore,
+  onCopy,
+  onExpandCluster,
 }: ClusterListViewProps) {
   const [sortMode, setSortMode] = useState<SortMode>("similarity");
 
-  // Group neighbors by cluster and sort based on current mode
-  const clusterGroups = useMemo(() => {
-    const groups: Record<number, WordNeighbor[]> = {};
-
-    // Initialize groups for all clusters
-    clusters.forEach((cluster) => {
-      groups[cluster.id] = [];
+  const sections = useMemo(() => {
+    const byCluster: Record<number, WordNeighbor[]> = {};
+    clusters.forEach((c) => {
+      byCluster[c.id] = [];
     });
-
-    // Group neighbors by cluster
-    neighbors.forEach((neighbor) => {
-      if (groups[neighbor.cluster]) {
-        groups[neighbor.cluster].push(neighbor);
-      }
+    neighbors.forEach((n) => {
+      if (n.word.toLowerCase() === queryWord.toLowerCase()) return;
+      byCluster[n.cluster]?.push(n);
     });
-
-    // Sort each group based on mode
-    Object.values(groups).forEach((group) => {
-      group.sort((a, b) => {
-        switch (sortMode) {
-          case "formality":
-            return (b.formality ?? 0.5) - (a.formality ?? 0.5); // formal first
-          case "alphabetical":
-            return a.word.localeCompare(b.word);
-          default:
-            return b.similarity - a.similarity;
+    // Fold expanded words into their sections (deduped)
+    Object.entries(expandedClusters).forEach(([cid, extra]) => {
+      const id = Number(cid);
+      if (!byCluster[id]) return;
+      const seen = new Set(byCluster[id].map((n) => n.word.toLowerCase()));
+      extra.forEach((n) => {
+        if (!seen.has(n.word.toLowerCase())) {
+          seen.add(n.word.toLowerCase());
+          byCluster[id].push({ ...n, cluster: id });
         }
       });
     });
 
-    return groups;
-  }, [neighbors, clusters, sortMode]);
+    const sorter = (a: WordNeighbor, b: WordNeighbor) => {
+      switch (sortMode) {
+        case "formality":
+          return (b.formality ?? 0.5) - (a.formality ?? 0.5);
+        case "alphabetical":
+          return a.word.localeCompare(b.word);
+        default:
+          return b.similarity - a.similarity;
+      }
+    };
+    Object.values(byCluster).forEach((group) => group.sort(sorter));
 
-  // Sort clusters by the highest similarity word in each cluster
-  const sortedClusters = useMemo(() => {
-    return [...clusters].sort((a, b) => {
-      const aMaxSim = clusterGroups[a.id]?.[0]?.similarity ?? 0;
-      const bMaxSim = clusterGroups[b.id]?.[0]?.similarity ?? 0;
-      return bMaxSim - aMaxSim;
-    });
-  }, [clusters, clusterGroups]);
-
-  // Convert hex color to rgba for background
-  const hexToRgba = (hex: string, alpha: number): string => {
-    const r = parseInt(hex.slice(1, 3), 16);
-    const g = parseInt(hex.slice(3, 5), 16);
-    const b = parseInt(hex.slice(5, 7), 16);
-    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-  };
-
-  // Get formality label
-  const getFormalityLabel = (f: number): string => {
-    if (f >= 0.7) return "formal";
-    if (f >= 0.5) return "neutral";
-    return "casual";
-  };
-
-  // Map similarity to font weight (400-700)
-  const getWeightFromSimilarity = (sim: number): number => {
-    return Math.round(400 + sim * 300);
-  };
+    return clusters
+      .map((c) => ({
+        cluster: c,
+        isPile: c.label.includes(PILE_MARKER),
+        words: byCluster[c.id] ?? [],
+      }))
+      .filter((s) => s.words.length > 0)
+      .sort((a, b) => {
+        if (a.isPile !== b.isPile) return a.isPile ? 1 : -1;
+        return (b.words[0]?.similarity ?? 0) - (a.words[0]?.similarity ?? 0);
+      });
+  }, [neighbors, clusters, queryWord, expandedClusters, sortMode]);
 
   return (
-    <div className="space-y-4">
-      {/* Sort controls */}
-      <div className="flex items-center justify-between px-1">
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-zinc-500 dark:text-zinc-400">Sort by:</span>
-          <div className="flex gap-1">
-            {(["similarity", "formality", "alphabetical"] as const).map((mode) => (
-              <button
-                key={mode}
-                onClick={() => setSortMode(mode)}
-                className={`px-2.5 py-1 text-xs rounded-md transition-colors ${
-                  sortMode === mode
-                    ? "bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100 font-medium"
-                    : "text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                }`}
-              >
-                {mode === "similarity" ? "strength" : mode}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="text-xs text-zinc-400 dark:text-zinc-500">
-          <span className="font-semibold">bold</span> = stronger
-          <span className="mx-2 text-zinc-300 dark:text-zinc-600">•</span>
-          <span className="italic">italic</span> = formal
-        </div>
-      </div>
-
-      {sortedClusters.map((cluster) => {
-        const words = clusterGroups[cluster.id];
-        if (!words || words.length === 0) return null;
-
-        return (
-          <div
-            key={cluster.id}
-            className="rounded-2xl overflow-hidden border transition-shadow hover:shadow-lg"
-            style={{
-              borderColor: hexToRgba(cluster.color, 0.3),
-              backgroundColor: hexToRgba(cluster.color, 0.03),
-            }}
-          >
-            {/* Cluster header */}
-            <div
-              className="px-5 py-3 flex items-center gap-3 border-b"
-              style={{
-                backgroundColor: hexToRgba(cluster.color, 0.08),
-                borderColor: hexToRgba(cluster.color, 0.15),
-              }}
+    <div className="space-y-8">
+      {/* Controls */}
+      <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2">
+        <div className="flex items-baseline gap-3 font-mono text-[10px] uppercase tracking-[0.14em]">
+          <span className="text-[var(--faint)]">sort</span>
+          {(["similarity", "formality", "alphabetical"] as const).map((mode) => (
+            <button
+              key={mode}
+              onClick={() => setSortMode(mode)}
+              className={
+                sortMode === mode
+                  ? "text-[var(--ink)] border-b border-[var(--accent)]"
+                  : "text-[var(--muted)] hover:text-[var(--ink)]"
+              }
             >
-              <span
-                className="w-3 h-3 rounded-full flex-shrink-0 ring-2 ring-white dark:ring-zinc-900"
-                style={{ backgroundColor: cluster.color }}
-              />
-              <h3 className="font-semibold text-zinc-700 dark:text-zinc-200 tracking-tight">
-                {cluster.label}
-              </h3>
-              <span className="text-sm text-zinc-400 dark:text-zinc-500 font-medium">
-                {words.length}
-              </span>
-            </div>
-
-            {/* Word list */}
-            <div className="px-4 py-4">
-              <div className="flex flex-wrap gap-2.5">
-                {words.map((neighbor) => {
-                  const isQueryWord = neighbor.word.toLowerCase() === queryWord.toLowerCase();
-                  const formality = neighbor.formality ?? 0.5;
-                  const isFormal = formality >= 0.6;
-
-                  return (
-                    <button
-                      key={neighbor.word}
-                      onClick={() => !isQueryWord && onWordClick(neighbor.word)}
-                      disabled={isQueryWord}
-                      className={`
-                        px-3 py-1.5 rounded-full text-sm
-                        transition-all duration-150
-                        ${isFormal ? "italic" : ""}
-                        ${
-                          isQueryWord
-                            ? "bg-zinc-200 dark:bg-zinc-700 text-zinc-500 dark:text-zinc-400 cursor-default border-2 border-zinc-300 dark:border-zinc-600"
-                            : "hover:scale-105 hover:-translate-y-0.5 hover:shadow-md cursor-pointer border-2"
-                        }
-                      `}
-                      style={
-                        isQueryWord
-                          ? { fontWeight: 500 }
-                          : {
-                              borderColor: cluster.color,
-                              backgroundColor: hexToRgba(cluster.color, 0.08),
-                              fontWeight: getWeightFromSimilarity(neighbor.similarity),
-                            }
-                      }
-                      title={`Strength: ${(neighbor.similarity * 100).toFixed(0)}% • Tone: ${getFormalityLabel(formality)}${neighbor.frequency !== "common" ? ` • ${neighbor.frequency}` : ""}`}
-                    >
-                      <span className="text-zinc-700 dark:text-zinc-200">
-                        {neighbor.word}
-                      </span>
-                      {neighbor.frequency === "rare" && (
-                        <span className="ml-1 text-xs text-amber-600 dark:text-amber-400 not-italic">
-                          ✦
-                        </span>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        );
-      })}
-
-      {/* Legend */}
-      <div className="text-center text-xs text-zinc-400 dark:text-zinc-500 pt-2 pb-2">
-        <p className="flex items-center justify-center gap-2 flex-wrap">
-          <span>Click to explore</span>
-          <span className="text-zinc-300 dark:text-zinc-600">•</span>
-          <span className="text-amber-500 dark:text-amber-400">✦</span>
-          <span>rare</span>
-          <span className="text-zinc-300 dark:text-zinc-600">•</span>
-          <span>Hover for details</span>
+              {mode === "similarity" ? "closeness" : mode === "alphabetical" ? "a–z" : mode}
+            </button>
+          ))}
+        </div>
+        <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--faint)]">
+          weight = closeness · <span className="italic normal-case">italic</span> = formal ·{" "}
+          <span className="text-[var(--accent)]">✦</span> rare · click copies · ↗ explores
         </p>
       </div>
+
+      {/* Sections */}
+      {sections.map(({ cluster, isPile, words }) => {
+        const isExpanded = (expandedClusters[cluster.id]?.length ?? 0) > 0;
+        const isExpanding = expandingCluster === cluster.id;
+        return (
+          <section
+            key={cluster.id}
+            className={`border-l-2 pl-5 ${isPile ? "border-dashed" : ""}`}
+            style={{ borderColor: isPile ? "var(--line)" : cluster.color }}
+          >
+            <div className="flex items-baseline gap-3 mb-3">
+              <h3 className="font-mono text-[11px] uppercase tracking-[0.16em] text-[var(--muted)]">
+                {cluster.label}
+              </h3>
+              <span className="font-mono text-[10px] text-[var(--faint)]">{words.length}</span>
+              {!isPile && (
+                <button
+                  onClick={() => onExpandCluster(cluster.id)}
+                  disabled={isExpanding || isExpanded}
+                  className="font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--faint)] hover:text-[var(--accent)] transition-colors disabled:hover:text-[var(--faint)]"
+                  title={isExpanded ? "expanded" : "pull more words from this neighborhood"}
+                >
+                  {isExpanding ? "…" : isExpanded ? "expanded" : "+ more"}
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap items-baseline gap-x-5 gap-y-2.5">
+              {words.map((n) => {
+                const sim = Math.max(0, Math.min(1, n.similarity));
+                const formal = (n.formality ?? 0.5) >= 0.6;
+                return (
+                  <span key={n.word} className="group inline-flex items-baseline gap-1">
+                    <button
+                      onClick={() => onCopy(n.word)}
+                      title={`copy “${n.word}” · ${Math.round(sim * 100)}% close${formal ? " · formal" : ""}${n.frequency === "rare" ? " · rare" : ""}`}
+                      className={`leading-snug transition-colors hover:text-[var(--accent)] ${
+                        isPile ? "text-[var(--muted)]" : "text-[var(--ink)]"
+                      }`}
+                      style={{
+                        fontWeight: isPile ? 430 : 420 + sim * 260,
+                        fontSize: isPile ? "0.95rem" : `${0.95 + sim * 0.3}rem`,
+                        fontStyle: formal ? "italic" : "normal",
+                      }}
+                    >
+                      {n.word}
+                      {n.frequency === "rare" && (
+                        <sup className="text-[var(--accent)] text-[9px] ml-0.5 not-italic">✦</sup>
+                      )}
+                    </button>
+                    <button
+                      onClick={() => onExplore(n.word)}
+                      title={`explore “${n.word}”`}
+                      aria-label={`explore ${n.word}`}
+                      className="font-mono text-[10px] text-[var(--faint)] opacity-0 group-hover:opacity-100 focus:opacity-100 hover:text-[var(--accent)] transition-opacity"
+                    >
+                      ↗
+                    </button>
+                  </span>
+                );
+              })}
+            </div>
+          </section>
+        );
+      })}
     </div>
   );
 }

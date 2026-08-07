@@ -1,20 +1,22 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Archivo, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+const archivo = Archivo({
   subsets: ["latin"],
+  style: ["normal", "italic"],
+  variable: "--font-archivo",
 });
 
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
+const jbmono = JetBrains_Mono({
   subsets: ["latin"],
+  variable: "--font-jbmono",
 });
 
 export const metadata: Metadata = {
   title: "Semantic Word Explorer",
-  description: "Discover unexpected words through semantic relationships. An advanced thesaurus powered by word embeddings.",
+  description:
+    "An instrument for finding the word you almost have — senses, synonyms, and the neighborhood of meaning around any word.",
 };
 
 export default function RootLayout({
@@ -24,9 +26,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
-      >
+      <body className={`${archivo.variable} ${jbmono.variable} antialiased`}>
         {children}
       </body>
     </html>

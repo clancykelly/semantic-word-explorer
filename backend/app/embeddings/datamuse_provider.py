@@ -483,6 +483,38 @@ class DatamuseProvider(EmbeddingProvider):
             for x, y in coords
         ]
 
+    def _compute_coordinates_semantic(
+        self,
+        words: list[dict[str, Any]],
+        clusters: list[int],
+        query_word: str,
+        layout: str = "sectors",
+    ) -> tuple[list[tuple[float, float]], tuple[float, float]]:
+        """Real 2D positions: PCA of the actual word vectors.
+
+        Returns (word_coords, query_coord). Distance on screen finally means
+        semantic distance — unlike the synthetic sector layouts, which are kept
+        only as the no-vectors fallback.
+        """
+        if self._vectors is None or not words:
+            return self._compute_coordinates(words, clusters, query_word, layout), (0.5, 0.5)
+
+        texts = [w.get("word", "").lower() for w in words]
+        X = self._vectors.encode([query_word.lower()] + texts)
+        Xc = X - X.mean(axis=0)
+        try:
+            _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
+        except np.linalg.LinAlgError:
+            return self._compute_coordinates(words, clusters, query_word, layout), (0.5, 0.5)
+        P = Xc @ Vt[:2].T
+        mins, maxs = P.min(axis=0), P.max(axis=0)
+        span = np.where((maxs - mins) < 1e-6, 1.0, maxs - mins)
+        P01 = 0.06 + 0.88 * (P - mins) / span
+
+        all_coords = [(float(x), float(y)) for x, y in P01]
+        spread = self._avoid_collisions(all_coords, min_distance=0.035)
+        return spread[1:], spread[0]
+
     def _compute_coordinates(
         self,
         words: list[dict[str, Any]],
@@ -1687,7 +1719,9 @@ class DatamuseProvider(EmbeddingProvider):
         cluster_assignments, custom_cluster_labels = self._assign_clusters(
             results, precomputed_assignments, precomputed_labels, query_word=normalized
         )
-        coordinates = self._compute_coordinates(results, cluster_assignments, normalized, layout)
+        coordinates, query_xy = self._compute_coordinates_semantic(
+            results, cluster_assignments, normalized, layout
+        )
         # Find the true max score across all results for proper normalization
         max_score = max((r.get("score", 0) for r in results), default=1)
         if max_score == 0:
@@ -1701,7 +1735,7 @@ class DatamuseProvider(EmbeddingProvider):
             WordResult(
                 word=normalized,
                 similarity=1.0,
-                coordinates=(0.5, 0.5),
+                coordinates=query_xy,
                 frequency="common",
                 cluster=0,
                 formality=compute_formality(normalized),
