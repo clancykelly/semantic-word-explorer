@@ -310,9 +310,11 @@ class DatamuseProvider(EmbeddingProvider):
     ) -> np.ndarray | None:
         """Cosine of each word to the query vector (sense centroid when seeded).
 
-        Under a sense, the query token is stripped from phrases before encoding
-        ("central bank" scores as "central"), so phrases containing the query
-        word can't free-ride on its vector and swamp the minority sense.
+        The query token is always stripped from phrases before encoding
+        ("world bank" scores as "world", "bank account" as "account"): a phrase
+        containing the query token would otherwise score near 1.0 and free-ride
+        to the top of every ranking. A compound is as relevant as its
+        distinctive remainder.
         """
         qvec = self._query_vector(query_word, seeds, query_weight=query_weight)
         if qvec is None:
@@ -321,7 +323,7 @@ class DatamuseProvider(EmbeddingProvider):
         enc: list[str] = []
         for w in words:
             wl = w.lower()
-            if seeds and " " in wl:
+            if " " in wl:
                 parts = [p for p in wl.split() if p != qtok]
                 wl = " ".join(parts) if parts else wl
             enc.append(wl)
@@ -1284,7 +1286,12 @@ class DatamuseProvider(EmbeddingProvider):
 
             # Determine the effective threshold for this candidate
             if is_phrase:
-                effective_threshold = curated_phrase_threshold if (is_moby or is_conceptnet) else phrase_threshold
+                if query_word.lower() in word.lower().split():
+                    # Contains the query token, so it was scored by its
+                    # distinctive remainder — honest score, standard bars.
+                    effective_threshold = curated_threshold if (is_moby or is_conceptnet) else ml_threshold
+                else:
+                    effective_threshold = curated_phrase_threshold if (is_moby or is_conceptnet) else phrase_threshold
             elif is_moby or is_conceptnet:
                 effective_threshold = curated_threshold
             else:
