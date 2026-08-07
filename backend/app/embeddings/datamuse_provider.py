@@ -1885,7 +1885,7 @@ class DatamuseProvider(EmbeddingProvider):
 
         # Similarity = cosine to the query (or the sense centroid, when active)
         result_words = [r.get("word", "") for r in results]
-        sims = self._sims_to_query(normalized, [w.lower() for w in result_words], seeds)
+        sims = self._sims_to_query(normalized, [w.lower() for w in result_words], None)
         if sims is None:
             sims = [0.5] * len(results)
 

@@ -57,7 +57,7 @@ export default function Home() {
 
       <footer className="px-6 py-5">
         <p className="max-w-xl mx-auto font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--faint)]">
-          / to search · click copies · ↗ explores
+          / to search · click a word to open it · hover to copy
         </p>
       </footer>
     </div>

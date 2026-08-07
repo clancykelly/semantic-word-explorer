@@ -269,8 +269,13 @@ def expand_cluster(
 
     start_time = time.perf_counter()
 
-    # Parse and normalize anchor words
-    anchors = [normalize_word(w) for w in anchor_words.split(",")]
+    # Parse and normalize anchor words — unlike query normalization, spaces are
+    # preserved: anchors are often phrases ("world bank"), and stripping the
+    # space would mangle them into nonsense tokens ("worldbank").
+    def normalize_anchor(w: str) -> str:
+        return re.sub(r"[^a-z ]", "", w.lower()).strip()
+
+    anchors = [normalize_anchor(w) for w in anchor_words.split(",")]
     anchors = [w for w in anchors if w]  # Filter out empty after normalization
     if not anchors:
         return JSONResponse(
@@ -291,10 +296,10 @@ def expand_cluster(
             ).model_dump(),
         )
 
-    # Parse and normalize exclude words
+    # Parse and normalize exclude words (spaces preserved, same as anchors)
     exclude_list = []
     if exclude:
-        exclude_list = [normalize_word(w) for w in exclude.split(",")]
+        exclude_list = [normalize_anchor(w) for w in exclude.split(",")]
         exclude_list = [w for w in exclude_list if w]
 
     # Normalize the query word

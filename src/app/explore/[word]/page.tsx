@@ -121,9 +121,13 @@ export default function ExplorePage({ params }: ExplorePageProps) {
       if (!state.data || expandingCluster !== null) {
         return;
       }
-      const clusterWords = state.data.neighbors
+      // Prefer single words as anchors — they make much better ml seeds than
+      // phrases; fall back to phrases only if the cluster has nothing else.
+      const ranked = state.data.neighbors
         .filter((n) => n.cluster === clusterId)
-        .sort((a, b) => b.similarity - a.similarity)
+        .sort((a, b) => b.similarity - a.similarity);
+      const singles = ranked.filter((n) => !n.word.includes(" "));
+      const clusterWords = (singles.length >= 2 ? singles : ranked)
         .slice(0, 5)
         .map((n) => n.word);
       if (clusterWords.length === 0) {

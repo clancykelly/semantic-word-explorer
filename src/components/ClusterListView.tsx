@@ -99,7 +99,7 @@ export function ClusterListView({
         </div>
         <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--faint)]">
           weight = closeness · <span className="italic normal-case">italic</span> = formal ·{" "}
-          <span className="text-[var(--accent)]">✦</span> rare · click copies · ↗ explores
+          <span className="text-[var(--accent)]">✦</span> rare · click opens · hover to copy
         </p>
       </div>
 
@@ -136,8 +136,8 @@ export function ClusterListView({
                 return (
                   <span key={n.word} className="group inline-flex items-baseline gap-1">
                     <button
-                      onClick={() => onCopy(n.word)}
-                      title={`copy “${n.word}” · ${Math.round(sim * 100)}% close${formal ? " · formal" : ""}${n.frequency === "rare" ? " · rare" : ""}`}
+                      onClick={() => onExplore(n.word)}
+                      title={`open “${n.word}” · ${Math.round(sim * 100)}% close${formal ? " · formal" : ""}${n.frequency === "rare" ? " · rare" : ""}`}
                       className={`leading-snug transition-colors hover:text-[var(--accent)] ${
                         isPile ? "text-[var(--muted)]" : "text-[var(--ink)]"
                       }`}
@@ -153,12 +153,12 @@ export function ClusterListView({
                       )}
                     </button>
                     <button
-                      onClick={() => onExplore(n.word)}
-                      title={`explore “${n.word}”`}
-                      aria-label={`explore ${n.word}`}
-                      className="font-mono text-[10px] text-[var(--faint)] opacity-0 group-hover:opacity-100 focus:opacity-100 hover:text-[var(--accent)] transition-opacity"
+                      onClick={() => onCopy(n.word)}
+                      title={`copy “${n.word}” to clipboard`}
+                      aria-label={`copy ${n.word}`}
+                      className="font-mono text-[9px] uppercase tracking-[0.08em] text-[var(--faint)] opacity-0 group-hover:opacity-100 focus:opacity-100 hover:text-[var(--accent)] transition-opacity"
                     >
-                      ↗
+                      copy
                     </button>
                   </span>
                 );
