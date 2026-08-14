@@ -16,6 +16,7 @@ import httpx
 import numpy as np
 
 from .base import EmbeddingProvider, SearchResult, SenseInfo, WordResult
+from .lexicon import DEEP_REGISTERS, Lexicon
 from .moby_thesaurus import get_moby_thesaurus
 from .vectors import WordVectors
 
@@ -174,6 +175,12 @@ class DatamuseProvider(EmbeddingProvider):
         self._conceptnet_cache_ttl: float = 3600.0  # 1 hour
         # Sense inventory cache: word -> list of sense dicts (see get_senses)
         self._sense_cache: dict[str, list[dict[str, Any]]] = {}
+        # Our own Wiktionary-derived lexicon (deep vocabulary + register labels)
+        self._lexicon: Lexicon | None = None
+
+    def set_lexicon(self, lexicon: Lexicon) -> None:
+        """Enable the private lexicon as a candidate source + register oracle."""
+        self._lexicon = lexicon
 
     def set_vectors(self, vectors: WordVectors) -> None:
         """Set the static word-vector model for relevance scoring + clustering."""
@@ -1069,7 +1076,13 @@ class DatamuseProvider(EmbeddingProvider):
                 break
 
         # Curated sources (Moby, ConceptNet) are treated as common
-        is_curated = "moby" in tags or "conceptnet" in tags or "syn" in tags
+        # Register rarity (archaic/poetic/literary/...) is the meaningful kind —
+        # it marks deep-cut vocabulary rather than corpus-frequency noise.
+        regs = set((word_data.get("_registers") or "").split(",")) - {""}
+        if regs & DEEP_REGISTERS:
+            return "rare"
+
+        is_curated = "moby" in tags or "conceptnet" in tags or "syn" in tags or "lex" in tags
         if is_curated:
             return "common"
 
@@ -1235,6 +1248,7 @@ class DatamuseProvider(EmbeddingProvider):
             is_synonym = "syn" in tags  # Datamuse explicit synonym
             is_moby = "moby" in tags    # From Moby Thesaurus
             is_conceptnet = "conceptnet" in tags  # From ConceptNet
+            is_lex = "lex" in tags      # From our Wiktionary lexicon
             word = candidate.get("word", "")
             is_phrase = " " in word
 
@@ -1292,7 +1306,7 @@ class DatamuseProvider(EmbeddingProvider):
                     effective_threshold = curated_threshold if (is_moby or is_conceptnet) else ml_threshold
                 else:
                     effective_threshold = curated_phrase_threshold if (is_moby or is_conceptnet) else phrase_threshold
-            elif is_moby or is_conceptnet:
+            elif is_moby or is_conceptnet or is_lex:
                 effective_threshold = curated_threshold
             else:
                 effective_threshold = ml_threshold
@@ -1385,7 +1399,7 @@ class DatamuseProvider(EmbeddingProvider):
             # (they're from curated sources, so they're legitimate words)
             is_moby = "moby" in tags
             is_conceptnet = "conceptnet" in tags
-            is_curated_source = is_moby or is_conceptnet
+            is_curated_source = is_moby or is_conceptnet or "lex" in tags
             if freq is None:
                 freq = 0.5 if is_curated_source else 0.0
 
@@ -1709,6 +1723,42 @@ class DatamuseProvider(EmbeddingProvider):
         if conceptnet_added > 0 or conceptnet_tagged > 0:
             print(f"ConceptNet: {conceptnet_added} new words, {conceptnet_tagged} existing words tagged")
 
+        # Our own lexicon: curated Wiktionary links + neighbors from our private
+        # index — vocabulary far beyond what the APIs return, with registers.
+        if self._lexicon is not None:
+            by_word = {r.get("word", "").lower(): r for r in results}
+            lex_added = lex_tagged = 0
+            for lw, regs in self._lexicon.candidates(normalized, k=160).items():
+                # Skip the query's own morphological family (sadful, walkee…)
+                # and hyphenated obscurities — subword embeddings rank them
+                # deceptively close, but they're not the deep cuts we want.
+                if (
+                    lw == normalized
+                    or lw in _SENSE_STOP
+                    or "-" in lw
+                    or normalized in lw
+                    or lw in normalized
+                ):
+                    continue
+                existing = by_word.get(lw)
+                if existing is not None:
+                    tags_list = existing.setdefault("tags", [])
+                    if "lex" not in tags_list:
+                        tags_list.append("lex")
+                        lex_tagged += 1
+                    if regs:
+                        existing["_registers"] = ",".join(sorted(regs))
+                elif lw not in seen_words:
+                    cand = {"word": lw, "score": 400, "tags": ["lex"]}
+                    if regs:
+                        cand["_registers"] = ",".join(sorted(regs))
+                    results.append(cand)
+                    seen_words.add(lw)
+                    by_word[lw] = cand
+                    lex_added += 1
+            if lex_added or lex_tagged:
+                print(f"Lexicon: {lex_added} new words, {lex_tagged} existing words tagged")
+
         if not results:
             return None
 
@@ -1759,6 +1809,50 @@ class DatamuseProvider(EmbeddingProvider):
             results = results + colloc
             precomputed_assignments = precomputed_assignments + [pile_id] * len(colloc)
             precomputed_labels = (precomputed_labels or []) + ["related · often co-occurring"]
+
+        # Deep cuts: register-marked vocabulary (archaic / poetic / literary /
+        # dialectal / rare) gets its own section — the reason this app exists.
+        if self._lexicon is not None and precomputed_assignments is not None and results:
+            pile_cluster = None
+            if precomputed_labels:
+                for ci, lab in enumerate(precomputed_labels):
+                    if "co-occurring" in lab:
+                        pile_cluster = ci
+            regmap = self._lexicon.registers([r.get("word", "").lower() for r in results])
+            deep_indices: list[int] = []
+            for i, r in enumerate(results):
+                if pile_cluster is not None and precomputed_assignments[i] == pile_cluster:
+                    continue  # leave the co-occurring pile intact
+                rw = r.get("word", "").lower()
+                # No derivatives of the query, and deep cuts must be genuinely
+                # related — register alone isn't enough.
+                if normalized in rw or rw in normalized:
+                    continue
+                if float(r.get("_relevance", 0.0)) < 0.35:
+                    continue
+                # Must also be corpus-rare: register tags over-mark common words
+                # (one obsolete sense of "bad" shouldn't make it a deep cut).
+                freq = None
+                for t in r.get("tags", []):
+                    if t.startswith("f:"):
+                        try:
+                            freq = float(t[2:])
+                        except ValueError:
+                            pass
+                        break
+                if freq is not None and freq > 2.0:
+                    continue
+                regs = set((r.get("_registers") or "").split(",")) - {""}
+                regs |= regmap.get(rw, set())
+                if regs & DEEP_REGISTERS:
+                    r["_registers"] = ",".join(sorted(regs))
+                    deep_indices.append(i)
+            if len(deep_indices) >= 3:
+                deep_indices.sort(key=lambda i: -float(results[i].get("_relevance", 0.0)))
+                deep_id = max(precomputed_assignments) + 1
+                for i in deep_indices[:14]:
+                    precomputed_assignments[i] = deep_id
+                precomputed_labels = (precomputed_labels or []) + ["deep cuts · archaic & literary"]
 
         # Compute visualization data (reuse cluster info from sampling if available)
         cluster_assignments, custom_cluster_labels = self._assign_clusters(

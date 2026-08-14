@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .embeddings import DatamuseProvider, get_datamuse_provider, load_word_vectors
+from .embeddings.lexicon import load_lexicon
 from .embeddings.moby_thesaurus import get_moby_thesaurus
 from .llm import LLMEnricher
 from .models import (
@@ -46,6 +47,10 @@ async def lifespan(app: FastAPI):
     vectors = load_word_vectors()
     if vectors is not None:
         provider.set_vectors(vectors)
+        # Our own Wiktionary-derived lexicon (deep vocabulary + registers)
+        lexicon = load_lexicon(vectors)
+        if lexicon is not None:
+            provider.set_lexicon(lexicon)
     else:
         print("Word vectors unavailable; clustering will fall back to part-of-speech grouping")
 
