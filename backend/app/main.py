@@ -111,7 +111,7 @@ async def root():
 def explore_word(
     word: Annotated[str, Query(description="Word to explore")],
     sense: Annotated[str | None, Query(description="Specific sense to use")] = None,
-    limit: Annotated[int, Query(ge=1, le=500, description="Max neighbors to return")] = 150,
+    limit: Annotated[int, Query(ge=1, le=500, description="Max neighbors to return")] = 250,
     layout: Annotated[str, Query(description="Visualization layout: 'sectors' or 'force'")] = "sectors",
     include_rare: Annotated[bool, Query(description="Include rare/uncommon words")] = False,
     relevance: Annotated[

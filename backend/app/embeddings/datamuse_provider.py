@@ -177,6 +177,9 @@ class DatamuseProvider(EmbeddingProvider):
         self._sense_cache: dict[str, list[dict[str, Any]]] = {}
         # Our own Wiktionary-derived lexicon (deep vocabulary + register labels)
         self._lexicon: Lexicon | None = None
+        # Gloss-space vectors for relevance scoring: word -> (n_senses, dim)
+        self._gloss_vec_cache: dict[str, np.ndarray] = {}
+        self._query_gloss_cache: dict[str, np.ndarray] = {}
 
     def set_lexicon(self, lexicon: Lexicon) -> None:
         """Enable the private lexicon as a candidate source + register oracle."""
@@ -242,7 +245,7 @@ class DatamuseProvider(EmbeddingProvider):
                 label = label[:56].rsplit(" ", 1)[0] + "…"
             if not label:
                 continue
-            candidates.append({"pos": pos, "label": label, "seeds": seeds})
+            candidates.append({"pos": pos, "label": label, "seeds": seeds, "gloss": gloss[:200]})
 
         # Pick a diverse sense inventory via farthest-point selection: start
         # from the dominant sense (Datamuse orders defs by prominence), then
@@ -314,14 +317,19 @@ class DatamuseProvider(EmbeddingProvider):
         words: list[str],
         seeds: list[str] | None,
         query_weight: float = 0.25,
+        sense_gloss: str | None = None,
     ) -> np.ndarray | None:
-        """Cosine of each word to the query vector (sense centroid when seeded).
+        """Relevance of each word to the query: max of two views.
 
-        The query token is always stripped from phrases before encoding
-        ("world bank" scores as "world", "bank account" as "account"): a phrase
-        containing the query token would otherwise score near 1.0 and free-ride
-        to the top of every ranking. A compound is as relevant as its
-        distinctive remainder.
+        Word view — cosine of the word's own vector to the query vector (sense
+        centroid when seeded). The query token is stripped from phrases
+        ("world bank" scores as "world") so compounds can't free-ride.
+
+        Gloss view — cosine between the word's best-matching SENSE DEFINITION
+        and the query's definition (or the selected sense's gloss). A static
+        model is near-random on rare single tokens ("glum" vs "sad" = -0.04)
+        while definitions carry the meaning; this is what lets long-tail
+        synonyms survive the gate.
         """
         qvec = self._query_vector(query_word, seeds, query_weight=query_weight)
         if qvec is None:
@@ -334,7 +342,65 @@ class DatamuseProvider(EmbeddingProvider):
                 parts = [p for p in wl.split() if p != qtok]
                 wl = " ".join(parts) if parts else wl
             enc.append(wl)
-        return self._vectors.encode(enc) @ qvec
+        sims = self._vectors.encode(enc) @ qvec
+
+        qg = self._query_gloss_vector(query_word, sense_gloss)
+        if qg is None:
+            return sims
+        return np.maximum(sims, self._gloss_sims([w.lower() for w in words], qg))
+
+    def _encode_nocache(self, texts: list[str]) -> np.ndarray:
+        """L2-normalized vectors without touching the per-word cache (gloss
+        texts are numerous and one-off; caching them would leak memory)."""
+        raw = np.asarray(self._vectors._encode_uncached(texts), dtype=np.float32)
+        norms = np.linalg.norm(raw, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return raw / norms
+
+    def _query_gloss_vector(self, query_word: str, sense_gloss: str | None) -> np.ndarray | None:
+        """Vector of the query's definition (selected sense's gloss when given)."""
+        if self._lexicon is None or self._vectors is None:
+            return None
+        key = f"{query_word.lower()}||{sense_gloss or ''}"
+        v = self._query_gloss_cache.get(key)
+        if v is None:
+            # Inside a sense, use the bare gloss: prefixing the query word would
+            # re-inject it and let the sense-agnostic backbone through again.
+            text = sense_gloss if sense_gloss else self._lexicon.text_for(query_word.lower())
+            if text == query_word.lower():
+                return None  # no definition known -> no gloss view
+            v = self._encode_nocache([text])[0]
+            if len(self._query_gloss_cache) > 2000:
+                self._query_gloss_cache.clear()
+            self._query_gloss_cache[key] = v
+        return v
+
+    def _gloss_sims(self, words: list[str], qg: np.ndarray) -> np.ndarray:
+        """Per word: max cosine of its sense glosses to ``qg`` (0 if no gloss)."""
+        out = np.zeros(len(words), dtype=np.float32)
+        missing = [w for w in dict.fromkeys(words) if w not in self._gloss_vec_cache and " " not in w]
+        if missing:
+            gl = self._lexicon.glosses(missing)
+            texts: list[str] = []
+            owners: list[str] = []
+            for w in missing:
+                for g in gl.get(w, []):
+                    texts.append(f"{w}: {g}")
+                    owners.append(w)
+            per: dict[str, list[np.ndarray]] = {}
+            if texts:
+                for w, v in zip(owners, self._encode_nocache(texts)):
+                    per.setdefault(w, []).append(v)
+            if len(self._gloss_vec_cache) > 30000:
+                self._gloss_vec_cache.clear()
+            empty = np.zeros((0, qg.shape[0]), dtype=np.float32)
+            for w in missing:
+                self._gloss_vec_cache[w] = np.stack(per[w]) if w in per else empty
+        for i, w in enumerate(words):
+            m = self._gloss_vec_cache.get(w)
+            if m is not None and len(m):
+                out[i] = float((m @ qg).max())
+        return out
 
     def _fetch_from_api(self, params: dict[str, str]) -> list[dict[str, Any]]:
         """Fetch results from Datamuse API."""
@@ -1107,6 +1173,7 @@ class DatamuseProvider(EmbeddingProvider):
         candidates: list[dict[str, Any]],
         seeds: list[str] | None = None,
         query_weight: float = 0.25,
+        sense_gloss: str | None = None,
     ) -> list[tuple[dict[str, Any], float]]:
         """Compute cosine similarity between each candidate and the query word.
 
@@ -1119,7 +1186,9 @@ class DatamuseProvider(EmbeddingProvider):
             Words without embeddings get similarity of 0.0.
         """
         words = [c.get("word", "").lower() for c in candidates]
-        sims = self._sims_to_query(query_word, words, seeds, query_weight=query_weight)
+        sims = self._sims_to_query(
+            query_word, words, seeds, query_weight=query_weight, sense_gloss=sense_gloss
+        )
         if sims is None:
             # No vectors - return all with similarity 1.0 (no filtering)
             return [(c, 1.0) for c in candidates]
@@ -1188,6 +1257,7 @@ class DatamuseProvider(EmbeddingProvider):
         seeds: list[str] | None = None,
         functional_query: bool = False,
         strict_seed: bool = True,
+        sense_gloss: str | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Filter candidates by relevance to query word.
 
@@ -1209,7 +1279,11 @@ class DatamuseProvider(EmbeddingProvider):
         # "money senses all look the same" failure).
         strict = strict_seed and seeds is not None
         scored = self._compute_query_relevance(
-            query_word, candidates, seeds=seeds, query_weight=0.0 if strict else 0.25
+            query_word,
+            candidates,
+            seeds=seeds,
+            query_weight=0.0 if strict else 0.25,
+            sense_gloss=sense_gloss,
         )
 
         if not scored:
@@ -1230,8 +1304,10 @@ class DatamuseProvider(EmbeddingProvider):
         # - Datamuse synonyms (rel_syn): always kept (high-quality curated)
         # - Moby / ConceptNet: lower floor (0.25) but still filtered
         # - Uncurated ML results need higher threshold to filter tangential words
-        ml_threshold = max(threshold + 0.05, 0.30)  # Stricter for ML-only results
-        curated_threshold = max(threshold - 0.05, 0.15)  # Floor for Moby / ConceptNet single words
+        # Floors recalibrated for gloss-aware scoring (true synonyms now score
+        # ~0.25-0.65; noise stays <= ~0.1).
+        ml_threshold = max(threshold + 0.05, 0.25)  # Stricter for ML-only results
+        curated_threshold = max(threshold - 0.05, 0.12)  # Floor for Moby / lexicon single words
         if strict:
             # No discounts inside a sense: curated sources are sense-agnostic,
             # so they must clear the same bar as everything else.
@@ -1298,6 +1374,18 @@ class DatamuseProvider(EmbeddingProvider):
                     filtered.append(candidate)
                 continue
 
+            # Consensus: a single word confirmed by several independent curated
+            # sources (Datamuse, Moby, Wiktionary links) is a synonym by
+            # evidence, whatever the vectors think of it ("glum", "trudge").
+            # All-senses view only — inside a sense it would re-admit the
+            # sense-agnostic backbone.
+            if seeds is None and not is_phrase:
+                n_src = sum(1 for t in ("ml", "syn", "moby", "lex", "conceptnet") if t in tags)
+                if (n_src >= 3 and sim >= 0.0) or (n_src == 2 and sim >= 0.10):
+                    candidate["_relevance"] = sim
+                    filtered.append(candidate)
+                    continue
+
             # Determine the effective threshold for this candidate
             if is_phrase:
                 if query_word.lower() in word.lower().split():
@@ -1327,6 +1415,7 @@ class DatamuseProvider(EmbeddingProvider):
                 seeds=seeds,
                 functional_query=functional_query,
                 strict_seed=False,
+                sense_gloss=sense_gloss,
             )
 
         # Related-but-not-similar pool: ml-only single words that failed the
@@ -1592,6 +1681,7 @@ class DatamuseProvider(EmbeddingProvider):
             inventory = self.get_senses(normalized)
             sense_info = next((s for s in inventory if s["id"] == sense), None)
         seeds = sense_info["seeds"] if sense_info else None
+        sense_gloss = sense_info.get("gloss") if sense_info else None
 
         pool = ThreadPoolExecutor(max_workers=5)
         f_syn = pool.submit(
@@ -1650,6 +1740,7 @@ class DatamuseProvider(EmbeddingProvider):
         for ml_word in ml_results:
             word_text = ml_word.get("word", "")
             if word_text not in seen_words:
+                ml_word.setdefault("tags", []).append("ml")  # provenance, for consensus
                 results.append(ml_word)
                 seen_words.add(word_text)
 
@@ -1728,7 +1819,7 @@ class DatamuseProvider(EmbeddingProvider):
         if self._lexicon is not None:
             by_word = {r.get("word", "").lower(): r for r in results}
             lex_added = lex_tagged = 0
-            for lw, regs in self._lexicon.candidates(normalized, k=160).items():
+            for lw, meta in self._lexicon.candidates(normalized, k=160).items():
                 # Skip the query's own morphological family (sadful, walkee…)
                 # and hyphenated obscurities — subword embeddings rank them
                 # deceptively close, but they're not the deep cuts we want.
@@ -1740,16 +1831,20 @@ class DatamuseProvider(EmbeddingProvider):
                     or lw in normalized
                 ):
                     continue
+                regs = meta["registers"]
+                # "lex" = backed by a curated Wiktionary edge (counts as
+                # evidence); "lexnn" = pure vector neighbor from our index.
+                tag = "lex" if meta["link"] else "lexnn"
                 existing = by_word.get(lw)
                 if existing is not None:
                     tags_list = existing.setdefault("tags", [])
-                    if "lex" not in tags_list:
-                        tags_list.append("lex")
+                    if tag not in tags_list:
+                        tags_list.append(tag)
                         lex_tagged += 1
                     if regs:
                         existing["_registers"] = ",".join(sorted(regs))
                 elif lw not in seen_words:
-                    cand = {"word": lw, "score": 400, "tags": ["lex"]}
+                    cand = {"word": lw, "score": 400, "tags": [tag]}
                     if regs:
                         cand["_registers"] = ",".join(sorted(regs))
                     results.append(cand)
@@ -1776,7 +1871,12 @@ class DatamuseProvider(EmbeddingProvider):
         )
 
         results, colloc = self._filter_by_relevance(
-            normalized, results, threshold=relevance, seeds=seeds, functional_query=functional_query
+            normalized,
+            results,
+            threshold=relevance,
+            seeds=seeds,
+            functional_query=functional_query,
+            sense_gloss=sense_gloss,
         )
         # The co-occurring pile is an all-senses feature; sense views stay clean.
         if seeds is not None:
